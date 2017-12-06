@@ -910,6 +910,7 @@ partition_info::vers_part_rotate(THD * thd)
     Sql_condition::WARN_LEVEL_NOTE,
     WARN_VERS_PART_ROTATION,
     ER_THD(thd, WARN_VERS_PART_ROTATION),
+    table->s->db.str, table->s->table_name.str,
     old_part_name,
     vers_info->hist_part->partition_name);
 
