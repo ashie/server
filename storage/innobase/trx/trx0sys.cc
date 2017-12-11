@@ -240,10 +240,20 @@ trx_sys_update_wsrep_checkpoint(
 		unsigned char xid_uuid[16];
 		long long xid_seqno = read_wsrep_xid_seqno(xid);
 		read_wsrep_xid_uuid(xid, xid_uuid);
-
+#ifdef OLD_WSREP
+		if (!memcmp(xid_uuid, trx_sys_cur_xid_uuid, 16) &&
+		    xid_seqno != -1)
+#endif
 		if (!memcmp(xid_uuid, trx_sys_cur_xid_uuid, 8)) {
-			ut_ad(xid_seqno > trx_sys_cur_xid_seqno);
-			trx_sys_cur_xid_seqno = xid_seqno;
+			/*
+			This check is a protection against the initial seqno (-1)
+			assigned in read_wsrep_xid_uuid(), which, if not checked,
+			would cause the following assertion to fail.
+			*/
+			if (xid_seqno > -1 )
+			{
+				ut_ad(xid_seqno > trx_sys_cur_xid_seqno);
+			}
 		} else {
 			memcpy(trx_sys_cur_xid_uuid, xid_uuid, 16);
 		}

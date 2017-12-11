@@ -345,6 +345,23 @@ trx_commit_step(
 /*============*/
 	que_thr_t*	thr);	/*!< in: query thread */
 
+#ifdef WITH_WSREP
+/**********************************************************************//**
+Prints info about a transaction.
+Transaction information may be retrieved without having trx_sys->mutex acquired
+so it may not be completely accurate. The caller must own lock_sys->mutex
+and the trx must have some locks to make sure that it does not escape
+without locking lock_sys->mutex. */
+UNIV_INTERN
+void
+wsrep_trx_print_locking(
+/*==============*/
+	FILE*		f,		/*!< in: output stream */
+	const trx_t*	trx,		/*!< in: transaction */
+	ulint		max_query_len)	/*!< in: max query length to print,
+					or 0 to use the default max length */
+	MY_ATTRIBUTE((nonnull));
+#endif /* WITH_WSREP */
 /**********************************************************************//**
 Prints info about a transaction.
 Caller must hold trx_sys->mutex. */
@@ -837,7 +854,6 @@ typedef enum {
 	TRX_WSREP_ABORT  = 1
 } trx_abort_t;
 
-
 /** Represents an instance of rollback segment along with its state variables.*/
 struct trx_undo_ptr_t {
 	trx_rseg_t*	rseg;		/*!< rollback segment assigned to the
@@ -1270,6 +1286,9 @@ struct trx_t {
 	os_event_t	wsrep_event;	/* event waited for in srv_conc_slot */
 #endif /* WITH_WSREP */
 
+	/* System Versioning */
+	bool		vers_update_trt;
+					/*!< Notify TRT on System Versioned write */
 	ulint		magic_n;
 
 	/** @return whether any persistent undo log has been generated */

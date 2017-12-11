@@ -301,6 +301,28 @@ public:
   }
 };
 
+class Name_resolution_context_backup
+{
+  Name_resolution_context &ctx;
+  TABLE_LIST &table_list;
+  table_map save_map;
+  Name_resolution_context_state ctx_state;
+
+public:
+  Name_resolution_context_backup(Name_resolution_context &_ctx, TABLE_LIST &_table_list)
+    : ctx(_ctx), table_list(_table_list), save_map(_table_list.map)
+  {
+    ctx_state.save_state(&ctx, &table_list);
+    ctx.table_list= &table_list;
+    ctx.first_name_resolution_table= &table_list;
+  }
+  ~Name_resolution_context_backup()
+  {
+    ctx_state.restore_state(&ctx, &table_list);
+    table_list.map= save_map;
+  }
+};
+
 
 /*
   This enum is used to report information about monotonicity of function
@@ -539,7 +561,6 @@ public:
   String_copier_for_item(THD *thd): m_thd(thd) { }
 };
 
-
 class Item: public Value_source,
             public Type_all_attributes
 {
@@ -775,6 +796,10 @@ public:
     return type_handler()->field_type();
   }
   virtual const Type_handler *type_handler() const= 0;
+  virtual uint field_flags() const
+  {
+    return 0;
+  }
   const Type_handler *type_handler_for_comparison() const
   {
     return type_handler()->type_handler_for_comparison();
@@ -1743,6 +1768,10 @@ public:
 
   virtual Item_field *field_for_view_update() { return 0; }
 
+  virtual Item *vers_optimized_fields_transformer(THD *thd, uchar *)
+  { return this; }
+  virtual bool vers_trx_id() const
+  { return false; }
   virtual Item *neg_transformer(THD *thd) { return NULL; }
   virtual Item *update_value_transformer(THD *thd, uchar *select_arg)
   { return this; }
@@ -1938,7 +1967,6 @@ public:
 };
 
 MEM_ROOT *get_thd_memroot(THD *thd);
-
 template <class T>
 inline Item* get_item_copy (THD *thd, T* item)
 {
@@ -2787,6 +2815,10 @@ public:
     return field->type_handler();
   }
   TYPELIB *get_typelib() const { return field->get_typelib(); }
+  uint32 field_flags() const
+  {
+    return field->flags;
+  }
   enum_monotonicity_info get_monotonicity_info() const
   {
     return MONOTONIC_STRICT_INCREASING;
@@ -2883,6 +2915,8 @@ public:
   uint32 max_display_length() const { return field->max_display_length(); }
   Item_field *field_for_view_update() { return this; }
   int fix_outer_field(THD *thd, Field **field, Item **reference);
+  virtual Item *vers_optimized_fields_transformer(THD *thd, uchar *);
+  virtual bool vers_trx_id() const;
   virtual Item *update_value_transformer(THD *thd, uchar *select_arg);
   Item *derived_field_transformer_for_having(THD *thd, uchar *arg);
   Item *derived_field_transformer_for_where(THD *thd, uchar *arg);
@@ -3335,6 +3369,14 @@ public:
       name.str= str_arg; name.length= safe_strlen(name.str);
       fixed= 1;
     }
+  Item_int(THD *thd, const char *str_arg,longlong i,uint length, bool flag):
+    Item_num(thd), value(i)
+    {
+      max_length=length;
+      name.str= str_arg; name.length= safe_strlen(name.str);
+      fixed= 1;
+      unsigned_flag= flag;
+    }
   Item_int(THD *thd, const char *str_arg, uint length=64);
   enum Type type() const { return INT_ITEM; }
   const Type_handler *type_handler() const
@@ -3785,10 +3827,10 @@ class Item_return_date_time :public Item_partition_func_safe_string
   enum_field_types date_time_field_type;
 public:
   Item_return_date_time(THD *thd, const char *name_arg, uint length_arg,
-                        enum_field_types field_type_arg):
+                        enum_field_types field_type_arg, uint dec_arg= 0):
     Item_partition_func_safe_string(thd, name_arg, length_arg, &my_charset_bin),
     date_time_field_type(field_type_arg)
-  { decimals= 0; }
+  { decimals= dec_arg; }
   const Type_handler *type_handler() const
   {
     return Type_handler::get_handler_by_field_type(date_time_field_type);
@@ -4029,6 +4071,13 @@ public:
   { return  val_decimal_from_date(decimal_value); }
   int save_in_field(Field *field, bool no_conversions)
   { return save_date_in_field(field, no_conversions); }
+  void set_time(MYSQL_TIME *ltime)
+  {
+    cached_time= *ltime;
+  }
+  bool operator>(const MYSQL_TIME &ltime) const;
+  bool operator<(const MYSQL_TIME &ltime) const;
+  bool operator==(const MYSQL_TIME &ltime) const;
 };
 
 
@@ -4088,7 +4137,7 @@ public:
 class Item_datetime_literal: public Item_temporal_literal
 {
 public:
-  Item_datetime_literal(THD *thd, MYSQL_TIME *ltime, uint dec_arg):
+  Item_datetime_literal(THD *thd, MYSQL_TIME *ltime, uint dec_arg= 0):
     Item_temporal_literal(thd, ltime, dec_arg)
   {
     max_length= MAX_DATETIME_WIDTH + (decimals ? decimals + 1 : 0);
@@ -4556,6 +4605,12 @@ public:
         ((Item_field *) item)->field && item->const_item())
       return 0;
     return cleanup_processor(arg);
+  }
+  virtual bool vers_trx_id() const
+  {
+    DBUG_ASSERT(ref);
+    DBUG_ASSERT(*ref);
+    return (*ref)->vers_trx_id();
   }
 };
 
@@ -5071,6 +5126,7 @@ public:
 #include "item_xmlfunc.h"
 #include "item_jsonfunc.h"
 #include "item_create.h"
+#include "item_vers.h"
 #endif
 
 /**
@@ -6010,37 +6066,59 @@ class Item_type_holder: public Item,
 {
 protected:
   TYPELIB *enum_set_typelib;
+private:
+  void init_flags(Item *item)
+  {
+    if (item->real_type() == Item::FIELD_ITEM)
+    {
+      Item_field *item_field= (Item_field *)item->real_item();
+      m_flags|= (item_field->field->flags &
+               (VERS_SYS_START_FLAG | VERS_SYS_END_FLAG));
+      // TODO: additional field flag?
+      m_vers_trx_id= item_field->field->vers_trx_id();
+    }
+  }
 public:
   Item_type_holder(THD *thd, Item *item)
    :Item(thd, item),
     Type_handler_hybrid_field_type(item->real_type_handler()),
-    enum_set_typelib(0)
+    enum_set_typelib(0),
+    m_flags(0),
+    m_vers_trx_id(false)
   {
     DBUG_ASSERT(item->fixed);
     maybe_null= item->maybe_null;
+    init_flags(item);
   }
   Item_type_holder(THD *thd,
-                   const LEX_CSTRING *name_arg,
+                   Item *item,
                    const Type_handler *handler,
                    const Type_all_attributes *attr,
                    bool maybe_null_arg)
    :Item(thd),
     Type_handler_hybrid_field_type(handler),
     Type_geometry_attributes(handler, attr),
-    enum_set_typelib(attr->get_typelib())
+    enum_set_typelib(attr->get_typelib()),
+    m_flags(0),
+    m_vers_trx_id(false)
   {
-    name= *name_arg;
+    name= item->name;
     Type_std_attributes::set(*attr);
     maybe_null= maybe_null_arg;
+    init_flags(item);
   }
 
   const Type_handler *type_handler() const
   {
-    const Type_handler *handler= Type_handler_hybrid_field_type::type_handler();
+    const Type_handler *handler= m_vers_trx_id ?
+      &type_handler_vers_trx_id :
+      Type_handler_hybrid_field_type::type_handler();
     return handler->type_handler_for_item_field();
   }
   const Type_handler *real_type_handler() const
   {
+    if (m_vers_trx_id)
+      return &type_handler_vers_trx_id;
     return Type_handler_hybrid_field_type::type_handler();
   }
 
@@ -6065,6 +6143,19 @@ public:
     Type_geometry_attributes::set_geometry_type(type);
   }
   Item* get_copy(THD *thd) { return 0; }
+
+private:
+  uint m_flags;
+  bool m_vers_trx_id;
+public:
+  uint32 field_flags() const
+  {
+    return m_flags;
+  }
+  virtual bool vers_trx_id() const
+  {
+    return m_vers_trx_id;
+  }
 };
 
 

@@ -160,9 +160,6 @@ static int partition_initialize(void *p)
 bool Partition_share::init(uint num_parts)
 {
   DBUG_ENTER("Partition_share::init");
-  mysql_mutex_init(key_partition_auto_inc_mutex,
-                   &auto_inc_mutex,
-                   MY_MUTEX_INIT_FAST);
   auto_inc_initialized= false;
   partition_name_hash_initialized= false;
   next_auto_inc_val= 0;
@@ -385,6 +382,13 @@ const char *ha_partition::table_type() const
   // we can do this since we only support a single engine type
   return m_file[0]->table_type(); 
 }
+#ifdef WITH_WSREP
+int ha_partition::wsrep_db_type() const
+{ 
+  // we can do this since we only support a single engine type
+  return ha_legacy_type(m_file[0]->ht); 
+}
+#endif /* WITH_WSREP */
 
 
 /*
@@ -1265,12 +1269,12 @@ int ha_partition::handle_opt_part(THD *thd, HA_CHECK_OPT *check_opt,
    (modelled after mi_check_print_msg)
    TODO: move this into the handler, or rewrite mysql_admin_table.
 */
-static bool print_admin_msg(THD* thd, uint len,
+bool print_admin_msg(THD* thd, uint len,
                             const char* msg_type,
                             const char* db_name, String &table_name,
                             const char* op_name, const char *fmt, ...)
   ATTRIBUTE_FORMAT(printf, 7, 8);
-static bool print_admin_msg(THD* thd, uint len,
+bool print_admin_msg(THD* thd, uint len,
                             const char* msg_type,
                             const char* db_name, String &table_name,
                             const char* op_name, const char *fmt, ...)
@@ -4321,6 +4325,15 @@ int ha_partition::update_row(const uchar *old_data, const uchar *new_data)
     if (error)
       goto exit;
 
+    if (m_part_info->part_type == VERSIONING_PARTITION)
+    {
+      uint sub_factor= m_part_info->num_subparts ? m_part_info->num_subparts : 1;
+      DBUG_ASSERT(m_tot_parts == m_part_info->num_parts * sub_factor);
+      uint lpart_id= new_part_id / sub_factor;
+      // lpart_id is VERSIONING partition because new_part_id != old_part_id
+      m_part_info->vers_update_stats(thd, lpart_id);
+    }
+
     tmp_disable_binlog(thd); /* Do not replicate the low-level changes. */
     error= m_file[old_part_id]->ha_delete_row(old_data);
     reenable_binlog(thd);
@@ -5751,6 +5764,22 @@ int ha_partition::index_next_same(uchar *buf, const uchar *key, uint keylen)
   if (!m_ordered_scan_ongoing)
     DBUG_RETURN(handle_unordered_next(buf, TRUE));
   DBUG_RETURN(handle_ordered_next(buf, TRUE));
+}
+
+
+int ha_partition::index_read_last_map(uchar *buf,
+                                          const uchar *key,
+                                          key_part_map keypart_map)
+{
+  DBUG_ENTER("ha_partition::index_read_last_map");
+
+  m_ordered= true;                              // Safety measure
+  end_range= NULL;
+  m_index_scan_type= partition_index_read_last;
+  m_start_key.key= key;
+  m_start_key.keypart_map= keypart_map;
+  m_start_key.flag= HA_READ_PREFIX_LAST;
+  DBUG_RETURN(common_index_read(buf, true));
 }
 
 

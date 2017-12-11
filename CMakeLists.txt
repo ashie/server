@@ -381,6 +381,11 @@ INCLUDE(mariadb_connector_c) # this does ADD_SUBDIRECTORY(libmariadb)
 # Add storage engines and plugins.
 CONFIGURE_PLUGINS()
 
+IF(WITH_WSREP)
+ADD_SUBDIRECTORY(wsrep)
+INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/wsrep)
+ENDIF()
+
 ADD_SUBDIRECTORY(include)
 ADD_SUBDIRECTORY(dbug)
 ADD_SUBDIRECTORY(strings)
@@ -400,10 +405,6 @@ IF(NOT WITHOUT_SERVER)
    ADD_SUBDIRECTORY(libmysqld)
    ADD_SUBDIRECTORY(libmysqld/examples)
   ENDIF(WITH_EMBEDDED_SERVER)
-
-  IF(WITH_WSREP)
-    ADD_SUBDIRECTORY(wsrep)
-  ENDIF()
 
   ADD_SUBDIRECTORY(mysql-test)
   ADD_SUBDIRECTORY(mysql-test/lib/My/SafeProcess)
@@ -503,3 +504,5 @@ IF(NON_DISTRIBUTABLE_WARNING)
   MESSAGE(WARNING "
 You have linked MariaDB with GPLv3 libraries!  You may not distribute the resulting binary. If you do, you will put yourself into a legal problem with Free Software Foundation.")
 ENDIF()
+
+INCLUDE(${CMAKE_SOURCE_DIR}/cmake/print_warnings.cmake)

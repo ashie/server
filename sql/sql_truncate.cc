@@ -27,7 +27,8 @@
 #include "sql_truncate.h"
 #include "wsrep_mysqld.h"
 #include "sql_show.h"    //append_identifier()
-
+#include "sql_select.h"
+#include "sql_delete.h"
 
 /**
   Append a list of field names to a string.
@@ -419,9 +420,20 @@ bool Sql_cmd_truncate_table::truncate_table(THD *thd, TABLE_LIST *table_ref)
     if (WSREP(thd) &&
         wsrep_to_isolation_begin(thd, table_ref->db, table_ref->table_name, 0))
         DBUG_RETURN(TRUE);
-    if (lock_table(thd, table_ref, &hton_can_recreate))
-      DBUG_RETURN(TRUE);
 
+    /*
+      When using non-blocking operation for TRUNCATE always fall to
+      handler_truncate() in order to avoid calling lock_table_names()
+      twice.
+     */
+    if (WSREP(thd) && thd->wsrep_nbo_ctx) {
+      hton_can_recreate= false;
+    }
+    else
+    {
+      if (lock_table(thd, table_ref, &hton_can_recreate))
+        DBUG_RETURN(TRUE);
+    }
     if (hton_can_recreate)
     {
      /*
@@ -481,7 +493,6 @@ bool Sql_cmd_truncate_table::truncate_table(THD *thd, TABLE_LIST *table_ref)
   DBUG_RETURN(error);
 }
 
-
 /**
   Execute a TRUNCATE statement at runtime.
 
@@ -493,13 +504,20 @@ bool Sql_cmd_truncate_table::truncate_table(THD *thd, TABLE_LIST *table_ref)
 bool Sql_cmd_truncate_table::execute(THD *thd)
 {
   bool res= TRUE;
-  TABLE_LIST *first_table= thd->lex->select_lex.table_list.first;
+  TABLE_LIST *table= thd->lex->select_lex.table_list.first;
   DBUG_ENTER("Sql_cmd_truncate_table::execute");
 
-  if (check_one_table_access(thd, DROP_ACL, first_table))
+  if (table->vers_conditions)
+  {
+    if (check_one_table_access(thd, DELETE_VERSIONING_ROWS_ACL, table))
+      DBUG_RETURN(res);
+    DBUG_RETURN(mysql_delete(thd, table, NULL, NULL, -1, 0, NULL));
+  }
+
+  if (check_one_table_access(thd, DROP_ACL, table))
     DBUG_RETURN(res);
 
-  if (! (res= truncate_table(thd, first_table)))
+  if (! (res= truncate_table(thd, table)))
     my_ok(thd);
 
   DBUG_RETURN(res);

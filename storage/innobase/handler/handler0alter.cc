@@ -631,6 +631,10 @@ instant_alter_column_possible(
 	const Alter_inplace_info*	ha_alter_info,
 	const TABLE*			table)
 {
+	if (ha_alter_info->create_info->vers_info.with_system_versioning)
+		return false;
+
+
 	if (~ha_alter_info->handler_flags
 	    & Alter_inplace_info::ADD_STORED_BASE_COLUMN) {
 		return false;
@@ -4972,6 +4976,15 @@ new_clustered_failed:
 				field_type |= DATA_UNSIGNED;
 			}
 
+			if (altered_table->versioned()) {
+				if (i == altered_table->s->row_start_field) {
+					field_type |= DATA_VERS_START;
+				} else if (i ==
+					   altered_table->s->row_end_field) {
+					field_type |= DATA_VERS_END;
+				}
+			}
+
 			if (dtype_is_string_type(col_type)) {
 				charset_no = (ulint) field->charset()->number;
 
@@ -7070,7 +7083,11 @@ ok_exit:
 		ctx->add_index, ctx->add_key_numbers, ctx->num_to_add_index,
 		altered_table, ctx->add_cols, ctx->col_map,
 		ctx->add_autoinc, ctx->sequence, ctx->skip_pk_sort,
-		ctx->m_stage, add_v, eval_table);
+		ctx->m_stage, add_v, eval_table,
+		ha_alter_info->handler_flags & Alter_inplace_info::ALTER_DROP_HISTORICAL);
+
+	if (m_prebuilt->trx->vers_update_trt)
+		thd_vers_update_trt(m_user_thd, true);
 
 #ifndef DBUG_OFF
 oom:
@@ -9735,6 +9752,7 @@ foreign_fail:
 	MONITOR_ATOMIC_DEC(MONITOR_PENDING_ALTER_TABLE);
 	DBUG_RETURN(false);
 }
+
 
 /**
 @param thd the session

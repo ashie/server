@@ -1874,6 +1874,17 @@ public:
 };
 
 
+class Type_handler_vers_trx_id: public Type_handler_longlong
+{
+public:
+  virtual ~Type_handler_vers_trx_id() {}
+  Field *make_table_field(const LEX_CSTRING *name,
+                          const Record_addr &addr,
+                          const Type_all_attributes &attr,
+                          TABLE *table) const;
+};
+
+
 class Type_handler_int24: public Type_handler_general_purpose_int
 {
   static const Name m_name_mediumint;
@@ -2810,14 +2821,16 @@ public:
 class Type_handler_hybrid_field_type
 {
   const Type_handler *m_type_handler;
+  bool m_vers_trx_id;
   bool aggregate_for_min_max(const Type_handler *other);
+
 public:
   Type_handler_hybrid_field_type();
   Type_handler_hybrid_field_type(const Type_handler *handler)
-   :m_type_handler(handler)
+   :m_type_handler(handler), m_vers_trx_id(false)
   { }
   Type_handler_hybrid_field_type(const Type_handler_hybrid_field_type *other)
-    :m_type_handler(other->m_type_handler)
+    :m_type_handler(other->m_type_handler), m_vers_trx_id(other->m_vers_trx_id)
   { }
   const Type_handler *type_handler() const { return m_type_handler; }
   enum_field_types real_field_type() const
@@ -2902,6 +2915,7 @@ extern MYSQL_PLUGIN_IMPORT Type_handler_int24       type_handler_int24;
 extern MYSQL_PLUGIN_IMPORT Type_handler_long        type_handler_long;
 extern MYSQL_PLUGIN_IMPORT Type_handler_longlong    type_handler_longlong;
 extern MYSQL_PLUGIN_IMPORT Type_handler_longlong    type_handler_ulonglong;
+extern MYSQL_PLUGIN_IMPORT Type_handler_vers_trx_id type_handler_vers_trx_id;
 
 extern MYSQL_PLUGIN_IMPORT Type_handler_newdecimal  type_handler_newdecimal;
 extern MYSQL_PLUGIN_IMPORT Type_handler_olddecimal  type_handler_olddecimal;

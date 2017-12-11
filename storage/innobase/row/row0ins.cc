@@ -51,6 +51,8 @@ Created 4/20/1996 Heikki Tuuri
 #include "fts0types.h"
 #include "m_string.h"
 #include "gis0geo.h"
+#include "wsrep_mysqld.h"
+#include "wsrep_schema.h"
 
 /*************************************************************************
 IMPORTANT NOTE: Any operation that generates redo MUST check that there
@@ -429,7 +431,8 @@ row_ins_cascade_ancestor_updates_table(
 
 		upd_node = static_cast<upd_node_t*>(parent);
 
-		if (upd_node->table == table && upd_node->is_delete == FALSE) {
+		if (upd_node->table == table && upd_node->is_delete == FALSE
+			&& !upd_node->vers_delete) {
 
 			return(TRUE);
 		}
@@ -974,6 +977,8 @@ row_ins_foreign_fill_virtual(
 		innobase_init_vc_templ(index->table);
 	}
 
+	bool is_delete = node->is_delete || node->vers_delete;
+
 	for (ulint i = 0; i < n_v_fld; i++) {
 
 		dict_v_col_t*     col = dict_table_get_nth_v_col(
@@ -1005,14 +1010,14 @@ row_ins_foreign_fill_virtual(
 
 		upd_field_set_v_field_no(upd_field, i, index);
 
-		if (node->is_delete
+		if (is_delete
 		    ? (foreign->type & DICT_FOREIGN_ON_DELETE_SET_NULL)
 		    : (foreign->type & DICT_FOREIGN_ON_UPDATE_SET_NULL)) {
 
 			dfield_set_null(&upd_field->new_val);
 		}
 
-		if (!node->is_delete
+		if (!is_delete
 		    && (foreign->type & DICT_FOREIGN_ON_UPDATE_CASCADE)) {
 
 			dfield_t* new_vfield = innobase_get_computed_value(
@@ -1105,7 +1110,9 @@ row_ins_foreign_check_on_constraint(
 
 	node = static_cast<upd_node_t*>(thr->run_node);
 
-	if (node->is_delete && 0 == (foreign->type
+	bool is_delete = node->is_delete || node->vers_delete;
+
+	if (is_delete && 0 == (foreign->type
 				     & (DICT_FOREIGN_ON_DELETE_CASCADE
 					| DICT_FOREIGN_ON_DELETE_SET_NULL))) {
 
@@ -1116,7 +1123,7 @@ row_ins_foreign_check_on_constraint(
 		DBUG_RETURN(DB_ROW_IS_REFERENCED);
 	}
 
-	if (!node->is_delete && 0 == (foreign->type
+	if (!is_delete && 0 == (foreign->type
 				      & (DICT_FOREIGN_ON_UPDATE_CASCADE
 					 | DICT_FOREIGN_ON_UPDATE_SET_NULL))) {
 
@@ -1145,7 +1152,7 @@ row_ins_foreign_check_on_constraint(
 
 	cascade->foreign = foreign;
 
-	if (node->is_delete
+	if (is_delete
 	    && (foreign->type & DICT_FOREIGN_ON_DELETE_CASCADE)) {
 		cascade->is_delete = TRUE;
 	} else {
@@ -1284,7 +1291,7 @@ row_ins_foreign_check_on_constraint(
 						 clust_index, tmp_heap);
 	}
 
-	if (node->is_delete
+	if (is_delete
 	    ? (foreign->type & DICT_FOREIGN_ON_DELETE_SET_NULL)
 	    : (foreign->type & DICT_FOREIGN_ON_UPDATE_SET_NULL)) {
 
@@ -1364,7 +1371,7 @@ row_ins_foreign_check_on_constraint(
 		}
 	}
 
-	if (!node->is_delete
+	if (!is_delete
 	    && (foreign->type & DICT_FOREIGN_ON_UPDATE_CASCADE)) {
 
 		/* Build the appropriate update vector which sets changing
@@ -1568,6 +1575,74 @@ private:
 	ulint&		counter;
 };
 
+/*********************************************************************//**
+Reads sys_trx_end field from clustered index row.
+@return trx_id_t */
+static
+trx_id_t
+row_ins_get_sys_trx_end(
+/*===================================*/
+			const rec_t *rec,	/*!< in: clustered row */
+			ulint *offsets,		/*!< in: offsets */
+			dict_index_t *index)	/*!< in: clustered index */
+{
+	ut_a(dict_index_is_clust(index));
+
+	ulint len;
+	ulint nfield = dict_col_get_clust_pos(
+		&index->table->cols[index->table->vers_end], index);
+	const byte *field = rec_get_nth_field(rec, offsets, nfield, &len);
+	ut_a(len == 8);
+	return(mach_read_from_8(field));
+}
+
+/**
+Performs search at clustered index and returns sys_trx_end if row was found.
+@param[in]	index	secondary index of record
+@param[in]	rec	record in a secondary index
+@param[out]	end_trx_id	value from clustered index
+@return DB_SUCCESS, DB_NO_REFERENCED_ROW */
+static
+dberr_t
+row_ins_search_sys_trx_end(
+	dict_index_t *index,
+	const rec_t *rec,
+	trx_id_t *end_trx_id)
+{
+	ut_ad(!index->is_clust());
+
+	bool found = false;
+	mem_heap_t *heap = mem_heap_create(256);
+	dict_index_t *clust_index = NULL;
+	ulint offsets_[REC_OFFS_NORMAL_SIZE];
+	ulint *offsets = offsets_;
+	rec_offs_init(offsets_);
+
+	mtr_t mtr;
+	mtr_start(&mtr);
+
+	rec_t *clust_rec =
+	    row_get_clust_rec(BTR_SEARCH_LEAF, rec, index, &clust_index, &mtr);
+        if (!clust_rec)
+		goto not_found;
+
+	offsets = rec_get_offsets(clust_rec, clust_index, offsets, true,
+				  ULINT_UNDEFINED, &heap);
+
+	*end_trx_id = row_ins_get_sys_trx_end(clust_rec, offsets, clust_index);
+	found = true;
+not_found:
+	mtr_commit(&mtr);
+	mem_heap_free(heap);
+	if (!found) {
+		ib::error() << "foreign constraints: secondary index is out of "
+			       "sync";
+		ut_ad(false && "secondary index is out of sync");
+		return(DB_NO_REFERENCED_ROW);
+	}
+	return(DB_SUCCESS);
+}
+
 /***************************************************************//**
 Checks if foreign key constraint fails for an index entry. Sets shared locks
 which lock either the success or the failure of the constraint. NOTE that
@@ -1625,16 +1700,27 @@ row_ins_check_foreign_constraint(
 	/* If any of the foreign key fields in entry is SQL NULL, we
 	suppress the foreign key check: this is compatible with Oracle,
 	for example */
-	for (ulint i = 0; i < foreign->n_fields; i++) {
-		if (dfield_is_null(dtuple_get_nth_field(entry, i))) {
+	for (ulint i = 0; i < entry->n_fields; i++) {
+		dfield_t* field = dtuple_get_nth_field(entry, i);
+		if (i < foreign->n_fields && dfield_is_null(field)) {
 			goto exit_func;
+		}
+		/* System Versioning: if sys_trx_end != Inf, we
+		suppress the foreign key check */
+		if (table->versioned() &&
+		    dfield_get_type(field)->prtype & DATA_VERS_END) {
+			byte* data = static_cast<byte*>(dfield_get_data(field));
+			ut_ad(data);
+			trx_id_t end_trx_id = mach_read_from_8(data);
+			if (end_trx_id != TRX_ID_MAX)
+				goto exit_func;
 		}
 	}
 
 	if (que_node_get_type(thr->run_node) == QUE_NODE_UPDATE) {
 		upd_node = static_cast<upd_node_t*>(thr->run_node);
 
-		if (!(upd_node->is_delete) && upd_node->foreign == foreign) {
+		if (!(upd_node->is_delete) && !(upd_node->vers_delete) && upd_node->foreign == foreign) {
 			/* If a cascaded update is done as defined by a
 			foreign key constraint, do not check that
 			constraint for the child row. In ON UPDATE CASCADE
@@ -1757,6 +1843,23 @@ row_ins_check_foreign_constraint(
 		cmp = cmp_dtuple_rec(entry, rec, offsets);
 
 		if (cmp == 0) {
+			if (check_table->versioned()) {
+				trx_id_t end_trx_id = 0;
+
+				if (dict_index_is_clust(check_index)) {
+					end_trx_id =
+						row_ins_get_sys_trx_end(
+						rec, offsets, check_index);
+				} else if (row_ins_search_sys_trx_end(
+						check_index, rec, &end_trx_id) !=
+						DB_SUCCESS) {
+					break;
+				}
+
+				if (end_trx_id != TRX_ID_MAX)
+					continue;
+			}
+
 			if (rec_get_deleted_flag(rec,
 						 rec_offs_comp(offsets))) {
 				/* In delete-marked records, DB_TRX_ID must
@@ -3230,9 +3333,27 @@ row_ins_clust_index_entry(
 
 	n_uniq = dict_index_is_unique(index) ? index->n_uniq : 0;
 
+#ifdef WITH_WSREP
+	const bool skip_locking
+		= wsrep_thd_skip_locking(thr_get_trx(thr)->mysql_thd);
+	const ulint	flags = skip_locking | dict_table_is_temporary(index->table)
+		? BTR_NO_LOCKING_FLAG
+		: index->table->no_rollback() ? BTR_NO_ROLLBACK : 0;
+#ifdef UNIV_DEBUG
+	if (skip_locking && sr_table_name_full_str != index->table->name.m_name) {
+		WSREP_ERROR("Record locking is disabled in this thread, "
+			    "but the table being modified is not "
+			    "`%s`: `%s`.", sr_table_name_full_str.c_str(),
+			    index->table->name.m_name);
+		ut_error;
+	}
+#endif /* UNIV_DEBUG */
+
+#else
 	const ulint	flags = index->table->is_temporary()
 		? BTR_NO_LOCKING_FLAG
 		: index->table->no_rollback() ? BTR_NO_ROLLBACK : 0;
+#endif /* WITH_WSREP */
 	const ulint	orig_n_fields = entry->n_fields;
 
 	/* Try first optimistic descent to the B-tree */

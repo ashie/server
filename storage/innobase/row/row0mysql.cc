@@ -1427,7 +1427,8 @@ row_mysql_get_table_status(
 dberr_t
 row_insert_for_mysql(
 	const byte*	mysql_rec,
-	row_prebuilt_t*	prebuilt)
+	row_prebuilt_t*	prebuilt,
+	ins_mode_t	ins_mode)
 {
 	trx_savept_t	savept;
 	que_thr_t*	thr;
@@ -1494,6 +1495,27 @@ row_insert_for_mysql(
 	row_mysql_convert_row_to_innobase(node->row, prebuilt, mysql_rec,
 					  &blob_heap);
 
+	if (ins_mode != ROW_INS_NORMAL)
+	{
+		ut_ad(table->vers_start != table->vers_end);
+		/* Return back modified fields into mysql_rec, so that
+		   upper logic may benefit from it (f.ex. 'on duplicate key'). */
+		const mysql_row_templ_t* t = &prebuilt->mysql_template[table->vers_end];
+		ut_ad(t->mysql_col_len == 8);
+
+		if (ins_mode == ROW_INS_HISTORICAL) {
+			row_ins_set_tuple_col_8(node->row, table->vers_end, trx->id, node->vers_end_buf);
+		}
+		else /* ROW_INS_VERSIONED */ {
+			row_ins_set_tuple_col_8(node->row, table->vers_end, IB_UINT64_MAX, node->vers_end_buf);
+			int8store(&mysql_rec[t->mysql_col_offset], IB_UINT64_MAX);
+			t = &prebuilt->mysql_template[table->vers_start];
+			ut_ad(t->mysql_col_len == 8);
+			row_ins_set_tuple_col_8(node->row, table->vers_start, trx->id, node->vers_start_buf);
+			int8store(&mysql_rec[t->mysql_col_offset], trx->id);
+		}
+	}
+
 	savept = trx_savept_take(trx);
 
 	thr = que_fork_get_first_thr(prebuilt->ins_graph);
@@ -1546,6 +1568,10 @@ error_exit:
 	}
 
 	node->duplicate = NULL;
+
+	if (node->table->versioned() && ins_mode != ROW_INS_NORMAL) {
+		trx->vers_update_trt = true;
+	}
 
 	if (dict_table_has_fts_index(table)) {
 		doc_id_t	doc_id;
@@ -1837,9 +1863,12 @@ public:
 
 /** Does an update or delete of a row for MySQL.
 @param[in,out]	prebuilt	prebuilt struct in MySQL handle
+@param[in]	vers_set_fields	working with system versioned table
 @return error code or DB_SUCCESS */
 dberr_t
-row_update_for_mysql(row_prebuilt_t* prebuilt)
+row_update_for_mysql(
+	row_prebuilt_t*	prebuilt,
+	bool		vers_set_fields)
 {
 	trx_savept_t	savept;
 	dberr_t		err;
@@ -1854,6 +1883,7 @@ row_update_for_mysql(row_prebuilt_t* prebuilt)
 	upd_cascade_t*	new_upd_nodes;
 	upd_cascade_t*	processed_cascades;
 	bool		got_s_lock	= false;
+	bool		vers_delete	= prebuilt->upd_node->vers_delete;
 
 	DBUG_ENTER("row_update_for_mysql");
 
@@ -1963,6 +1993,49 @@ row_update_for_mysql(row_prebuilt_t* prebuilt)
 	thr->fk_cascade_depth = 0;
 
 run_again:
+	if (vers_set_fields)
+	{
+		/* System Versioning: modify update vector to set
+		   sys_trx_start (or sys_trx_end in case of DELETE)
+		   to current trx_id. */
+		dict_table_t* table = node->table;
+		dict_index_t* clust_index = dict_table_get_first_index(table);
+		upd_t* uvect = node->update;
+		upd_field_t* ufield;
+		dict_col_t* col;
+		unsigned col_idx;
+		if (node->is_delete || vers_delete) {
+			ufield = &uvect->fields[0];
+			uvect->n_fields = 0;
+			node->is_delete = false;
+			node->vers_delete = true;
+			col_idx = table->vers_end;
+		} else {
+			ut_ad(uvect->n_fields < table->n_cols);
+			ufield = &uvect->fields[uvect->n_fields];
+			col_idx = table->vers_start;
+		}
+		col = &table->cols[col_idx];
+		UNIV_MEM_INVALID(ufield, sizeof *ufield);
+		{
+			ulint field_no = dict_col_get_clust_pos(col, clust_index);
+			ut_ad(field_no != ULINT_UNDEFINED);
+			ufield->field_no = field_no;
+		}
+		ufield->orig_len = 0;
+		ufield->exp = NULL;
+
+		static const ulint fsize = sizeof(trx_id_t);
+		byte* buf = static_cast<byte*>(mem_heap_alloc(node->update->heap, fsize));
+		mach_write_to_8(buf, trx->id);
+		dfield_t* dfield = &ufield->new_val;
+		dfield_set_data(dfield, buf, fsize);
+		dict_col_copy_type(col, &dfield->type);
+
+		uvect->n_fields++;
+		ut_ad(node->in_mysql_interface); // otherwise needs to recalculate node->cmpl_info
+	}
+
 	if (thr->fk_cascade_depth == 1 && trx->dict_operation_lock_mode == 0) {
 		got_s_lock = true;
 		row_mysql_freeze_data_dictionary(trx);
@@ -2056,6 +2129,8 @@ run_again:
 		node->cascade_upd_nodes = cascade_upd_nodes;
 		cascade_upd_nodes->pop_front();
 		thr->fk_cascade_depth++;
+		vers_set_fields = node->table->versioned() &&
+				  (node->is_delete || node->versioned);
 
 		goto run_again;
 	}
@@ -2133,6 +2208,14 @@ run_again:
 	} else {
 		/* Always update the table modification counter. */
 		prebuilt->table->stat_modified_counter++;
+	}
+
+	if (node->table->versioned() &&
+	    (node->versioned || node->vers_delete ||
+	     // TODO: improve this check (check if we touch only
+	     // unversioned fields in foreigh table)
+	     node->foreign)) {
+		trx->vers_update_trt = true;
 	}
 
 	trx->op_info = "";

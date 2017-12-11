@@ -112,8 +112,9 @@
 
 #include "wsrep_mysqld.h"
 #include "wsrep_thd.h"
+#include "vtmd.h"
 
-static void wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
+static bool wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
                               Parser_state *parser_state,
                               bool is_com_multi,
                               bool is_next_command);
@@ -429,7 +430,7 @@ static bool some_non_temp_table_to_be_updated(THD *thd, TABLE_LIST *tables)
   @return 0     No implicit commit
   @return 1     Do a commit
 */
-static bool stmt_causes_implicit_commit(THD *thd, uint mask)
+bool stmt_causes_implicit_commit(const THD *thd, uint mask)
 {
   LEX *lex= thd->lex;
   bool skip= FALSE;
@@ -861,6 +862,16 @@ void init_update_queries(void)
   sql_command_flags[SQLCOM_REVOKE_ALL]|=       CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_INSTALL_PLUGIN]|=   CF_DISALLOW_IN_RO_TRANS;
   sql_command_flags[SQLCOM_UNINSTALL_PLUGIN]|= CF_DISALLOW_IN_RO_TRANS;
+#ifdef WITH_WSREP
+  /*
+    Statements for which some errors are ignored when
+    wsrep_ignore_apply_errors = WSREP_IGNORE_ERRORS_ON_RECONCILING_DDL
+  */
+  sql_command_flags[SQLCOM_DROP_DB]|=          CF_WSREP_MAY_IGNORE_ERRORS;
+  sql_command_flags[SQLCOM_DROP_TABLE]|=       CF_WSREP_MAY_IGNORE_ERRORS;
+  sql_command_flags[SQLCOM_DROP_INDEX]|=       CF_WSREP_MAY_IGNORE_ERRORS;
+  sql_command_flags[SQLCOM_ALTER_TABLE]|=      CF_WSREP_MAY_IGNORE_ERRORS;
+#endif /* WITH_WSREP */
 }
 
 bool sqlcom_can_generate_row_events(const THD *thd)
@@ -1160,7 +1171,8 @@ static enum enum_server_command fetch_command(THD *thd, char *packet)
 #ifdef WITH_WSREP
 static bool wsrep_node_is_ready(THD *thd)
 {
-  if (thd->variables.wsrep_on && !thd->wsrep_applier && !wsrep_ready)
+  if (thd->variables.wsrep_on && !(thd->wsrep_applier || thd->wsrep_SR_thd)
+      && !wsrep_ready_get())
   {
     my_message(ER_UNKNOWN_COM_ERROR,
                "WSREP has not yet prepared node for application use",
@@ -1170,6 +1182,27 @@ static bool wsrep_node_is_ready(THD *thd)
   return true;
 }
 #endif
+#ifdef WITH_WSREP
+static bool wsrep_tables_accessible_when_detached(const TABLE_LIST *tables)
+{
+  bool has_tables = false;
+  for (const TABLE_LIST *table= tables; table; table= table->next_global)
+  {
+    TABLE_CATEGORY c;
+    LEX_CSTRING    db, tn;
+    lex_string_set(&db, table->db);
+    lex_string_set(&tn, table->table_name);
+    c= get_table_category(&db, &tn);
+    if (c != TABLE_CATEGORY_INFORMATION &&
+        c != TABLE_CATEGORY_PERFORMANCE)
+    {
+      return false;
+    }
+    has_tables = true;
+  }
+  return has_tables;
+}
+#endif /* WITH_WSREP */
 
 /**
   Read one command from connection and execute it (query or simple command).
@@ -1195,19 +1228,6 @@ bool do_command(THD *thd)
   NET *net= &thd->net;
   enum enum_server_command command;
   DBUG_ENTER("do_command");
-
-#ifdef WITH_WSREP
-  if (WSREP(thd))
-  {
-    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-    thd->wsrep_query_state= QUERY_IDLE;
-    if (thd->wsrep_conflict_state==MUST_ABORT)
-    {
-      wsrep_client_rollback(thd);
-    }
-    mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-  }
-#endif /* WITH_WSREP */
 
   /*
     indicator of uninitialized lex => normal flow of errors handling
@@ -1249,29 +1269,6 @@ bool do_command(THD *thd)
   DEBUG_SYNC(thd, "before_do_command_net_read");
 
   packet_length= my_net_read_packet(net, 1);
-#ifdef WITH_WSREP
-  if (WSREP(thd)) {
-    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-
-    /* these THD's are aborted or are aborting during being idle */
-    if (thd->wsrep_conflict_state == ABORTING)
-    {
-      while (thd->wsrep_conflict_state == ABORTING) {
-        mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-        my_sleep(1000);
-        mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-      }
-      thd->store_globals();
-    }
-    else if (thd->wsrep_conflict_state == ABORTED)
-    {
-      thd->store_globals();
-    }
-
-    thd->wsrep_query_state= QUERY_EXEC;
-    mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-  }
-#endif /* WITH_WSREP */
 
   if (packet_length == packet_error)
   {
@@ -1279,19 +1276,6 @@ bool do_command(THD *thd)
 		       net->error,
 		       vio_description(net->vio)));
 
-#ifdef WITH_WSREP
-    if (WSREP(thd))
-    {
-      mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-      if (thd->wsrep_conflict_state == MUST_ABORT)
-      {
-        DBUG_PRINT("wsrep",("aborted for wsrep rollback: %lu",
-                            (ulong) thd->real_id));
-        wsrep_client_rollback(thd);
-      }
-      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-    }
-#endif /* WITH_WSREP */
 
     /* Instrument this broken statement as "statement/com/error" */
     thd->m_statement_psi= MYSQL_REFINE_STATEMENT(thd->m_statement_psi,
@@ -1343,23 +1327,37 @@ bool do_command(THD *thd)
   command= fetch_command(thd, packet);
 
 #ifdef WITH_WSREP
-  /*
-    Bail out if DB snapshot has not been installed.
-  */
-  if (!(server_command_flags[command] & CF_SKIP_WSREP_CHECK) &&
-      !wsrep_node_is_ready(thd))
+  if (WSREP(thd))
   {
-    thd->protocol->end_statement();
-
-    /* Performance Schema Interface instrumentation end. */
-    MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
-    thd->m_statement_psi= NULL;
-    thd->m_digest= NULL;
-
-    return_value= FALSE;
-    goto out;
+    /*
+     * bail out if DB snapshot has not been installed. We however,
+     * allow queries "SET" and "SHOW", they are trapped later in execute_command
+     */
+    if (!thd->wsrep_applier && !wsrep_ready_get() &&
+        command != COM_QUERY        &&
+        command != COM_PING         &&
+        command != COM_QUIT         &&
+        command != COM_PROCESS_INFO &&
+        command != COM_PROCESS_KILL &&
+        command != COM_SET_OPTION   &&
+        command != COM_SHUTDOWN     &&
+        command != COM_SLEEP        &&
+        command != COM_STATISTICS   &&
+        command != COM_TIME         &&
+        command != COM_END
+    ) {
+      my_message(ER_UNKNOWN_COM_ERROR,
+                 "WSREP has not yet prepared node for application use", MYF(0));
+      /* Performance Schema Interface instrumentation end. */
+      MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
+      thd->m_statement_psi= NULL;
+      thd->m_digest= NULL;
+      thd->protocol->end_statement();
+      return_value= FALSE;
+      goto out;
+    }
   }
-#endif
+#endif /* WITH_WSREP */
 
   /* Restore read timeout value */
   my_net_set_read_timeout(net, thd->variables.net_read_timeout);
@@ -1368,37 +1366,6 @@ bool do_command(THD *thd)
   DBUG_ASSERT(!thd->apc_target.is_enabled());
   return_value= dispatch_command(command, thd, packet+1,
                                  (uint) (packet_length-1), FALSE, FALSE);
-#ifdef WITH_WSREP
-  if (WSREP(thd))
-  {
-    while (thd->wsrep_conflict_state== RETRY_AUTOCOMMIT)
-    {
-      WSREP_DEBUG("Retry autocommit for: %s\n", thd->wsrep_retry_query);
-      CHARSET_INFO *current_charset = thd->variables.character_set_client;
-      if (!is_supported_parser_charset(current_charset))
-      {
-        /* Do not use non-supported parser character sets */
-        WSREP_WARN("Current client character set is non-supported parser "
-                   "character set: %s", current_charset->csname);
-        thd->variables.character_set_client = &my_charset_latin1;
-        WSREP_WARN("For retry temporally setting character set to : %s",
-                   my_charset_latin1.csname);
-      }
-      thd->clear_error();
-      return_value= dispatch_command(command, thd, thd->wsrep_retry_query,
-                                     thd->wsrep_retry_query_len, FALSE, FALSE);
-      thd->variables.character_set_client = current_charset;
-    }
-
-    if (thd->wsrep_retry_query && thd->wsrep_conflict_state != REPLAYING)
-    {
-      my_free(thd->wsrep_retry_query);
-      thd->wsrep_retry_query      = NULL;
-      thd->wsrep_retry_query_len  = 0;
-      thd->wsrep_retry_command    = COM_CONNECT;
-    }
-  }
-#endif /* WITH_WSREP */
   DBUG_ASSERT(!thd->apc_target.is_enabled());
 
 out:
@@ -1557,35 +1524,68 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
   compile_time_assert(COM_END == 255);
 
 #ifdef WITH_WSREP
-  if (WSREP(thd))
+  bool wsrep_on= WSREP_ON;
+  if (wsrep_on)
   {
-    if (!thd->in_multi_stmt_transaction_mode())
+    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+    DBUG_ASSERT(thd->wsrep_query_state() == QUERY_IDLE);
+    if (thd->wsrep_is_rolling_back())
     {
-      thd->wsrep_PA_safe= true;
+      /*
+        Rollback thread is rolling back a transaction for this thd,
+        wait until it has finished.
+      */
+      while (thd->wsrep_is_rolling_back())
+      {
+        mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+        my_sleep(1000);
+        mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+      }
+      DBUG_ASSERT(thd->wsrep_conflict_state() == ABORTED);
     }
 
-    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-    thd->wsrep_query_state= QUERY_EXEC;
-    if (thd->wsrep_conflict_state== RETRY_AUTOCOMMIT)
-    {
-      thd->wsrep_conflict_state= NO_CONFLICT;
-    }
-    if (thd->wsrep_conflict_state== MUST_ABORT)
-    {
-      wsrep_client_rollback(thd);
-    }
+    /*
+      BF aborter should atomically check thd query state and start
+      background rollback process if the thd query state is QUERY_IDLE.
+      Because the wait for the background rollback is done above we should
+      be here either in NO_CONFLICT or in ABORTED state.
+    */
+    DBUG_ASSERT(thd->wsrep_conflict_state() == NO_CONFLICT ||
+                thd->wsrep_conflict_state() == ABORTED);
+
+    thd->set_wsrep_query_state(QUERY_EXEC);
+
+    /*
+      Aborted by background rollbacker thread. Jump straight to dispatch_end
+      label where the error handling is performed.
+    */
     /* We let COM_QUIT and COM_STMT_CLOSE to execute even if wsrep aborted. */
-    if (thd->wsrep_conflict_state == ABORTED &&
+    if (thd->wsrep_conflict_state() == ABORTED &&
         command != COM_STMT_CLOSE && command != COM_QUIT)
     {
       my_message(ER_LOCK_DEADLOCK, "wsrep aborted transaction", MYF(0));
       WSREP_DEBUG("Deadlock error for: %s", thd->query());
-      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-      thd->reset_killed();
-      thd->mysys_var->abort     = 0;
-      thd->wsrep_conflict_state = NO_CONFLICT;
-      thd->wsrep_retry_counter  = 0;
-      goto dispatch_end;
+      if (command == COM_STMT_PREPARE          ||
+          command == COM_STMT_FETCH            ||
+          command == COM_STMT_SEND_LONG_DATA   ||
+          command == COM_STMT_CLOSE
+          )
+      {
+        WSREP_DEBUG("Prepared Statement bail out");
+      }
+      else
+      {
+        thd->reset_killed();
+        thd->mysys_var->abort       = 0;
+        thd->wsrep_retry_counter    = 0;
+        mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+        /*
+          Increment threads running to compensate dec_thread_running() called
+          after dispatch_end label.
+        */
+        inc_thread_running();
+        goto dispatch_end;
+      }
     }
     mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
   }
@@ -1636,6 +1636,13 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
     */
     thd->set_query_id(get_query_id());
   }
+#ifdef WITH_WSREP
+  if (WSREP(thd) && thd->wsrep_next_trx_id() == WSREP_UNDEFINED_TRX_ID)
+  {
+    thd->set_wsrep_next_trx_id(thd->query_id);
+    WSREP_DEBUG("assigned new next trx id: %lu", thd->wsrep_next_trx_id());
+  }
+#endif /* WITH_WSREP */
 
   if (!(server_command_flags[command] & CF_SKIP_QUESTIONS))
     statistic_increment(thd->status_var.questions, &LOCK_status);
@@ -1821,8 +1828,25 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       break;
 
     if (WSREP_ON)
-      wsrep_mysql_parse(thd, thd->query(), thd->query_length(), &parser_state,
-                        is_com_multi, is_next_command);
+    {
+      if (wsrep_mysql_parse(thd, thd->query(), thd->query_length(),
+                            &parser_state,
+                            is_com_multi, is_next_command))
+      {
+        WSREP_DEBUG("Deadlock error for: %s", thd->query());
+        mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+        thd->killed               = NOT_KILLED;
+        thd->mysys_var->abort     = 0;
+        thd->wsrep_retry_counter  = 0;
+        mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+        /*
+          Increment threads running to compensate dec_thread_running() called
+          after dispatch_end label.
+        */
+        inc_thread_running();
+        goto dispatch_end;
+      }
+    }
     else
       mysql_parse(thd, thd->query(), thd->query_length(), &parser_state,
                   is_com_multi, is_next_command);
@@ -1911,8 +1935,25 @@ bool dispatch_command(enum enum_server_command command, THD *thd,
       parser_state.reset(beginning_of_next_stmt, length);
 
       if (WSREP_ON)
-        wsrep_mysql_parse(thd, beginning_of_next_stmt, length, &parser_state,
-                          is_com_multi, is_next_command);
+      {
+        if (wsrep_mysql_parse(thd, beginning_of_next_stmt,
+                              length, &parser_state,
+                              is_com_multi, is_next_command))
+        {
+          WSREP_DEBUG("Deadlock error for: %s", thd->query());
+          mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+          thd->killed               = NOT_KILLED;
+          thd->mysys_var->abort     = 0;
+          thd->wsrep_retry_counter  = 0;
+          mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+          /*
+            Increment threads running to compensate dec_thread_running() called
+            after dispatch_end label.
+          */
+          inc_thread_running();
+          goto dispatch_end;
+        }
+      }
       else
         mysql_parse(thd, beginning_of_next_stmt, length, &parser_state,
                     is_com_multi, is_next_command);
@@ -2350,7 +2391,7 @@ com_multi_end:
 #ifdef WITH_WSREP
  dispatch_end:
 
-  if (WSREP(thd))
+  if (wsrep_on)
   {
     /*
       MDEV-10812
@@ -2360,13 +2401,47 @@ com_multi_end:
                   || thd->get_stmt_da()->is_disabled());
     /* wsrep BF abort in query exec phase */
     mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-    do_end_of_statement= thd->wsrep_conflict_state != REPLAYING &&
-                         thd->wsrep_conflict_state != RETRY_AUTOCOMMIT;
+    do_end_of_statement= thd->wsrep_conflict_state() != REPLAYING &&
+                         thd->wsrep_conflict_state() != RETRY_AUTOCOMMIT;
+    if (thd->wsrep_conflict_state() == MUST_ABORT)
+    {
+      wsrep_client_rollback(thd);
+      wsrep_post_rollback(thd);
+      DBUG_ASSERT(thd->wsrep_conflict_state() == ABORTED);
+    }
+    if (thd->wsrep_conflict_state() == ABORTED &&
+        !(command == COM_STMT_PREPARE          ||
+          command == COM_STMT_FETCH            ||
+          command == COM_STMT_SEND_LONG_DATA   ||
+          command == COM_STMT_CLOSE
+          ))
+    {
+      wsrep_override_error(thd, ER_LOCK_DEADLOCK);
+      wsrep_cleanup_transaction(thd);
+      WSREP_LOG_THD(thd, "leave");
+    }
     mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-  }
-  else
-    do_end_of_statement= true;
 
+    /*
+      Final check after sending response back to client. Handle possible
+      BF abort and query state change atomically. Don't call
+      wsrep_cleanup_transaction() to leave thd->wsrep_conflict_state()
+      to ABORTED so that the rollback will be detected when the client
+      returns to action.
+    */
+    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+    if (thd->wsrep_conflict_state() == MUST_ABORT)
+    {
+      wsrep_client_rollback(thd);
+      wsrep_post_rollback(thd);
+      WSREP_LOG_THD(thd, "after return to client found BF aborted");
+    }
+    thd->set_wsrep_query_state(QUERY_IDLE);
+    mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+
+  } else { /* if (WSREP(thd))... */
+    do_end_of_statement= true;
+  }
 #endif /* WITH_WSREP */
 
   if (do_end_of_statement)
@@ -3165,6 +3240,11 @@ bool Sql_cmd_call::execute(THD *thd)
     if (do_execute_sp(thd, sp))
       return true;
 
+    if (sp->sp_cache_version() == ULONG_MAX)
+    {
+      sp_cache_flush(thd->sp_proc_cache, sp);
+    }
+
     /*
       Disable slow log for the above call(), if calls are disabled.
       Instead we will log the executed statements to the slow log.
@@ -3390,7 +3470,7 @@ mysql_execute_command(THD *thd)
   } /* endif unlikely slave */
 #endif
 #ifdef WITH_WSREP
-  if  (wsrep && WSREP(thd))
+  if (WSREP(thd))
   {
     /*
       change LOCK TABLE WRITE to transaction
@@ -3416,20 +3496,23 @@ mysql_execute_command(THD *thd)
     }
 
     /*
-      Bail out if DB snapshot has not been installed. SET and SHOW commands,
-      however, are always allowed.
-      Select query is also allowed if it does not access any table.
-      We additionally allow all other commands that do not change data in
-      case wsrep_dirty_reads is enabled.
-    */
-    if (lex->sql_command != SQLCOM_SET_OPTION  &&
-        !wsrep_is_show_query(lex->sql_command) &&
-        !(thd->variables.wsrep_dirty_reads     &&
-          !is_update_query(lex->sql_command))  &&
-        !(lex->sql_command == SQLCOM_SELECT    &&
-          !all_tables)                         &&
-        !wsrep_node_is_ready(thd))
+     * bail out if DB snapshot has not been installed. We however,
+     * allow SET and SHOW queries and reads from information schema
+     * and dirty reads (if configured)
+     */
+    if (!(thd->wsrep_applier || thd->wsrep_SR_thd) &&
+        !(wsrep_ready_get() && wsrep_reject_queries == WSREP_REJECT_NONE)    &&
+        !(thd->variables.wsrep_dirty_reads &&
+          (sql_command_flags[lex->sql_command] & CF_CHANGES_DATA) == 0)    &&
+        !wsrep_tables_accessible_when_detached(all_tables)                 &&
+        lex->sql_command != SQLCOM_SET_OPTION                              &&
+        !wsrep_is_show_query(lex->sql_command))
+    {
+      my_message(ER_UNKNOWN_COM_ERROR,
+                 "WSREP has not yet prepared node for application use",
+                 MYF(0));
       goto error;
+      }
   }
 #endif /* WITH_WSREP */
   status_var_increment(thd->status_var.com_stat[lex->sql_command]);
@@ -3584,7 +3667,7 @@ mysql_execute_command(THD *thd)
     not run in it's own transaction it may simply never appear on
     the slave in case the outside transaction rolls back.
   */
-  if (stmt_causes_implicit_commit(thd, CF_IMPLICT_COMMIT_BEGIN))
+  if (stmt_causes_implicit_commit(thd, CF_IMPLICIT_COMMIT_BEGIN))
   {
     /*
       Note that this should never happen inside of stored functions
@@ -3655,6 +3738,17 @@ mysql_execute_command(THD *thd)
   /* Start timeouts */
   thd->set_query_timer();
 
+#ifdef WITH_WSREP
+  /*
+    THD is executing non-blocking operation. Set mark that the
+    execution has made it to actual command execution.
+  */
+  if (thd->wsrep_nbo_ctx) {
+    DBUG_ASSERT(thd->wsrep_nbo_ctx->executing() == false);
+    thd->wsrep_nbo_ctx->set_executing(true);
+  }
+#endif /* WITH_WSREP */
+
   switch (lex->sql_command) {
 
   case SQLCOM_SHOW_EVENTS:
@@ -3714,12 +3808,17 @@ mysql_execute_command(THD *thd)
   case SQLCOM_SELECT:
    {
 #ifdef WITH_WSREP
-      if (lex->sql_command == SQLCOM_SELECT)
-        WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_READ)
-      else
-        WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_SHOW)
+    DBUG_ASSERT(thd->wsrep_exec_mode != REPL_RECV);
+    if (lex->sql_command == SQLCOM_SELECT)
+    {
+      WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_READ);
+    }
+    else
+    {
+      WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_SHOW);
+    }
 #endif /* WITH_WSREP */
-
+    
     thd->status_var.last_query_cost= 0.0;
 
     /*
@@ -4015,7 +4114,6 @@ mysql_execute_command(THD *thd)
       copy.
     */
     Alter_info alter_info(lex->alter_info, thd->mem_root);
-
     if (thd->is_fatal_error)
     {
       /* If out of memory when creating a copy of alter_info. */
@@ -4043,6 +4141,7 @@ mysql_execute_command(THD *thd)
     */
     if (!(create_info.used_fields & HA_CREATE_USED_ENGINE))
       create_info.use_default_db_type(thd);
+
     /*
       If we are using SET CHARSET without DEFAULT, add an implicit
       DEFAULT to not confuse old users. (This may change).
@@ -4229,6 +4328,11 @@ mysql_execute_command(THD *thd)
       }
       else
       {
+        if (create_info.vers_info.check_and_fix_implicit(
+              thd, &alter_info, &create_info, create_table->table_name))
+        {
+          goto end_with_restore_list;
+        }
         /*
           In STATEMENT format, we probably have to replicate also temporary
           tables, like mysql replication does. Also check if the requested
@@ -4517,9 +4621,7 @@ end_with_restore_list:
     WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
     ha_rows found= 0, updated= 0;
     DBUG_ASSERT(first_table == all_tables && first_table != 0);
-      if (WSREP_CLIENT(thd) &&
-          wsrep_sync_wait(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE))
-        goto error;
+    WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
 
     if (update_precheck(thd, all_tables))
       break;
@@ -4668,9 +4770,7 @@ end_with_restore_list:
     WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_INSERT_REPLACE);
     DBUG_ASSERT(first_table == all_tables && first_table != 0);
 
-    if (WSREP_CLIENT(thd) &&
-        wsrep_sync_wait(thd, WSREP_SYNC_WAIT_BEFORE_INSERT_REPLACE))
-      goto error;
+    WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_INSERT_REPLACE);
 
     /*
       Since INSERT DELAYED doesn't support temporary tables, we could
@@ -4728,9 +4828,7 @@ end_with_restore_list:
     select_result *sel_result;
     bool explain= MY_TEST(lex->describe);
     DBUG_ASSERT(first_table == all_tables && first_table != 0);
-    if (WSREP_CLIENT(thd) &&
-        wsrep_sync_wait(thd, WSREP_SYNC_WAIT_BEFORE_INSERT_REPLACE))
-      goto error;
+    WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
 
     if ((res= insert_precheck(thd, all_tables)))
       break;
@@ -4851,9 +4949,7 @@ end_with_restore_list:
     WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
     select_result *sel_result=lex->result;
     DBUG_ASSERT(first_table == all_tables && first_table != 0);
-    if (WSREP_CLIENT(thd) &&
-        wsrep_sync_wait(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE))
-      goto error;
+    WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
 
     if ((res= delete_precheck(thd, all_tables)))
       break;
@@ -4913,9 +5009,7 @@ end_with_restore_list:
     DBUG_ASSERT(first_table == all_tables && first_table != 0);
     TABLE_LIST *aux_tables= thd->lex->auxiliary_table_list.first;
     multi_delete *result;
-    if (WSREP_CLIENT(thd) &&
-        wsrep_sync_wait(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE))
-      goto error;
+    WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE);
 
     if ((res= multi_delete_precheck(thd, all_tables)))
       break;
@@ -5091,9 +5185,46 @@ end_with_restore_list:
     if (check_one_table_access(thd, privilege, all_tables))
       goto error;
 
+#ifdef WITH_WSREP
+    /*
+      If wsrep_load_data_splitting is configured make LOAD DATA to
+      replicate on each 10K rows.
+
+      If streaming replication is not configured make LOAD DATA to
+      replicate on each 1MB.
+     */
+    ulong wsrep_trx_fragment_size_orig= thd->variables.wsrep_trx_fragment_size;
+    ulong wsrep_trx_fragment_unit_orig= thd->variables.wsrep_trx_fragment_unit;
+    const bool wsrep_on= WSREP(thd);
+    if (wsrep_on)
+    {
+      if (!wsrep_provider_is_SR_capable() ||
+          !thd->is_current_stmt_binlog_format_row())
+      {
+        thd->variables.wsrep_trx_fragment_size= 0;
+      }
+      else if (wsrep_load_data_splitting)
+      {
+        thd->variables.wsrep_trx_fragment_size= 10000;
+        thd->variables.wsrep_trx_fragment_unit= WSREP_FRAG_ROWS;
+      }
+      else if (thd->variables.wsrep_trx_fragment_size == 0)
+      {
+        thd->variables.wsrep_trx_fragment_size= (1 << 20);
+        thd->variables.wsrep_trx_fragment_unit= WSREP_FRAG_BYTES;
+      }
+    }
+#endif /* WITH_WSREP */
     res= mysql_load(thd, lex->exchange, first_table, lex->field_list,
                     lex->update_list, lex->value_list, lex->duplicates,
                     lex->ignore, (bool) lex->local_file);
+#ifdef WITH_WSREP
+    if (wsrep_on)
+    {
+      thd->variables.wsrep_trx_fragment_size= wsrep_trx_fragment_size_orig;
+      thd->variables.wsrep_trx_fragment_unit= wsrep_trx_fragment_unit_orig;
+    }
+#endif /* WITH_WSREP */
     break;
   }
 
@@ -5312,7 +5443,12 @@ end_with_restore_list:
   /* lex->unit.cleanup() is called outside, no need to call it here */
   break;
   case SQLCOM_SHOW_CREATE_EVENT:
-    WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_SHOW);
+#ifdef WITH_WSREP
+    if (WSREP_CLIENT(thd))
+    {
+      WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_SHOW);
+    }
+#endif /* WITH_WSREP */
     res= Events::show_create_event(thd, &lex->spname->m_db,
                                    &lex->spname->m_name);
     break;
@@ -5733,6 +5869,7 @@ end_with_restore_list:
       thd->mdl_context.release_transactional_locks();
       WSREP_DEBUG("BEGIN failed, MDL released: %lld",
                   (longlong) thd->thread_id);
+      WSREP_DEBUG("stmt_da, sql_errno: %d", (thd->get_stmt_da()->is_error()) ? thd->get_stmt_da()->sql_errno() : 0);
       goto error;
     }
     my_ok(thd);
@@ -5773,14 +5910,21 @@ end_with_restore_list:
       thd->print_aborted_warning(3, "RELEASE");
     }
 #ifdef WITH_WSREP
-    if (WSREP(thd) && (thd->wsrep_conflict_state != NO_CONFLICT &&
-                       thd->wsrep_conflict_state != REPLAYING))
-    {
-      DBUG_ASSERT(thd->is_error()); // the error is already issued
-    }
-    else
+    if (WSREP(thd)) {
+      mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+      if (thd->wsrep_conflict_state() == NO_CONFLICT ||
+          thd->wsrep_conflict_state() == REPLAYING)
+      {
+        my_ok(thd);
+      }
+      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+    } else {
 #endif /* WITH_WSREP */
+
       my_ok(thd);
+#ifdef WITH_WSREP
+    }
+#endif /* WITH_WSREP */
     break;
   }
   case SQLCOM_ROLLBACK:
@@ -5817,13 +5961,22 @@ end_with_restore_list:
     if (tx_release)
       thd->set_killed(KILL_CONNECTION);
 #ifdef WITH_WSREP
-    if (WSREP(thd) && thd->wsrep_conflict_state != NO_CONFLICT)
-    {
-      DBUG_ASSERT(thd->is_error()); // the error is already issued
-    }
-    else
+    if (WSREP(thd)) {
+      mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+      bool send_ok= (thd->wsrep_conflict_state() == NO_CONFLICT ||
+                     thd->wsrep_conflict_state() == REPLAYING);
+      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+      if (send_ok)
+      {
+        my_ok(thd);
+      }
+    } else {
 #endif /* WITH_WSREP */
-      my_ok(thd);
+    my_ok(thd);
+#ifdef WITH_WSREP
+    }
+#endif /* WITH_WSREP */
+
    break;
   }
   case SQLCOM_RELEASE_SAVEPOINT:
@@ -6258,6 +6411,17 @@ finish:
   DBUG_ASSERT(!thd->in_active_multi_stmt_transaction() ||
                thd->in_multi_stmt_transaction_mode());
 
+#ifdef WITH_WSREP
+  /*
+    Thread was executing non-blocking operation. Total order isolation
+    has been released after locking table names. We need to grab
+    total order isolation section here again to commit/binlog in order.
+   */
+  if (thd->wsrep_nbo_ctx)
+  {
+    wsrep_end_nbo_lock(thd, first_table);
+  }
+#endif /* WITH_WSREP */
 
   lex->unit.cleanup();
 
@@ -6279,14 +6443,41 @@ finish:
       THD_STAGE_INFO(thd, stage_rollback);
       trans_rollback_stmt(thd);
     }
-    else
+#ifdef WITH_WSREP
+    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+    if (thd->spcont &&
+        (thd->wsrep_conflict_state() == MUST_ABORT ||
+         thd->wsrep_conflict_state() == ABORTED    ||
+         thd->wsrep_conflict_state() == CERT_FAILURE))
     {
+      /*
+        The error was cleared, but THD was aborted by wsrep and
+        wsrep_conflict_state is still set accordingly. This
+        situation is expected if we are running a stored procedure
+        that declares a handler that catches ER_LOCK_DEADLOCK error.
+        In which case the error may have been cleared in method
+        sp_rcontext::handle_sql_condition().
+      */
+      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+      trans_rollback_stmt(thd);
+      mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+      thd->set_wsrep_conflict_state(NO_CONFLICT);
+      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+
+      thd->killed= NOT_KILLED;
+    }
+   else
+    {
+      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+#endif /* WITH_WSREP */
       /* If commit fails, we should be able to reset the OK status. */
       THD_STAGE_INFO(thd, stage_commit);
       thd->get_stmt_da()->set_overwrite_status(true);
       trans_commit_stmt(thd);
       thd->get_stmt_da()->set_overwrite_status(false);
+#ifdef WITH_WSREP
     }
+#endif /* WITH_WSREP */
 #ifdef WITH_ARIA_STORAGE_ENGINE
     ha_maria::implicit_commit(thd, FALSE);
 #endif
@@ -6294,9 +6485,6 @@ finish:
 
   /* Free tables. Set stage 'closing tables' */
   close_thread_tables(thd);
-#ifdef WITH_WSREP
-  thd->wsrep_consistency_check= NO_CONSISTENCY_CHECK;
-#endif /* WITH_WSREP */
 
 
 #ifndef DBUG_OFF
@@ -6358,9 +6546,10 @@ finish:
 
   TRANSACT_TRACKER(add_trx_state_from_thd(thd));
 
-  WSREP_TO_ISOLATION_END;
-
 #ifdef WITH_WSREP
+  thd->wsrep_consistency_check= NO_CONSISTENCY_CHECK;
+  
+  WSREP_TO_ISOLATION_END;
   /*
     Force release of transactional locks if not in active MST and wsrep is on.
   */
@@ -6373,6 +6562,14 @@ finish:
                 (longlong) thd->thread_id);
     thd->mdl_context.release_transactional_locks();
   }
+
+  /*
+    Non-blocking operation finished execution.
+  */
+  if (thd->wsrep_nbo_ctx) thd->wsrep_nbo_ctx->set_executing(false);
+
+  /* assume PA safety for next transaction */
+  thd->wsrep_PA_safe= true;
 #endif /* WITH_WSREP */
 
   DBUG_RETURN(res || thd->is_error());
@@ -6394,6 +6591,21 @@ static bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables)
   }
   if (check_dependencies_in_with_clauses(lex->with_clauses_list))
     return 1;
+
+  if (thd->variables.vers_alter_history == VERS_ALTER_HISTORY_SURVIVE)
+  {
+    for (TABLE_LIST *table= all_tables; table; table= table->next_local)
+    {
+      if (table->vers_conditions)
+      {
+        VTMD_exists vtmd(*table);
+        if (vtmd.check_exists(thd))
+          return 1;
+        if (vtmd.exists && vtmd.setup_select(thd))
+          return 1;
+      }
+    }
+  }
 
   if (!(res= open_and_lock_tables(thd, all_tables, TRUE, 0)))
   {
@@ -6505,6 +6717,7 @@ static bool execute_show_status(THD *thd, TABLE_LIST *all_tables)
   bool res;
   system_status_var old_status_var= thd->status_var;
   thd->initial_status_var= &old_status_var;
+  WSREP_SYNC_WAIT(thd, WSREP_SYNC_WAIT_BEFORE_SHOW);
   if (!(res= check_table_access(thd, SELECT_ACL, all_tables, FALSE,
                                 UINT_MAX, FALSE)))
     res= execute_sqlcom_select(thd, all_tables);
@@ -6523,6 +6736,8 @@ static bool execute_show_status(THD *thd, TABLE_LIST *all_tables)
          offsetof(STATUS_VAR, last_cleared_system_status_var));
   mysql_mutex_unlock(&LOCK_status);
   return res;
+ error:
+  return true;
 }
 
 
@@ -7721,82 +7936,124 @@ void mysql_init_multi_delete(LEX *lex)
   lex->query_tables_last= &lex->query_tables;
 }
 
-static void wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
+static bool wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
                               Parser_state *parser_state,
                               bool is_com_multi,
                               bool is_next_command)
 {
 #ifdef WITH_WSREP
+  mysql_mutex_lock(&thd->LOCK_wsrep_thd);
   bool is_autocommit=
-    !thd->in_multi_stmt_transaction_mode()                  &&
-    thd->wsrep_conflict_state == NO_CONFLICT                &&
+    !thd->in_multi_stmt_transaction_mode()                    &&
+    thd->wsrep_conflict_state() == NO_CONFLICT                &&
     !thd->wsrep_applier;
 
   do
   {
-    if (thd->wsrep_conflict_state== RETRY_AUTOCOMMIT)
+    if (thd->wsrep_conflict_state() == RETRY_AUTOCOMMIT)
     {
-      thd->wsrep_conflict_state= NO_CONFLICT;
+      thd->set_wsrep_conflict_state(NO_CONFLICT);
       /* Performance Schema Interface instrumentation, begin */
       thd->m_statement_psi= MYSQL_REFINE_STATEMENT(thd->m_statement_psi,
 	      com_statement_info[thd->get_command()].m_key);
       MYSQL_SET_STATEMENT_TEXT(thd->m_statement_psi, thd->query(),
 	                       thd->query_length());
     }
+    mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
     mysql_parse(thd, rawbuf, length, parser_state, is_com_multi,
                 is_next_command);
+    (void) RUN_HOOK(transaction, after_command,
+                    (thd, !thd->in_active_multi_stmt_transaction()));
+
+    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+
+    /*
+      State after after_command hook must be either NO_CONFLICT
+      or MUST_ABORT if the BF abort happened just after leaving
+      after_command hook.
+    */
+    DBUG_ASSERT(thd->wsrep_conflict_state() == NO_CONFLICT ||
+                thd->wsrep_conflict_state() == MUST_ABORT ||
+                thd->wsrep_conflict_state() == RETRY_AUTOCOMMIT);
 
     if (WSREP(thd)) {
-      /* wsrep BF abort in query exec phase */
-      mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-      if (thd->wsrep_conflict_state == MUST_ABORT) {
-        wsrep_client_rollback(thd);
-
-        WSREP_DEBUG("abort in exec query state, avoiding autocommit");
-      }
-
-      if (thd->wsrep_conflict_state == MUST_REPLAY)
-      {
-        wsrep_replay_transaction(thd);
-      }
-
-      /* setting error code for BF aborted trxs */
-      if (thd->wsrep_conflict_state == ABORTED ||
-          thd->wsrep_conflict_state == CERT_FAILURE)
+      if (thd->wsrep_conflict_state() == RETRY_AUTOCOMMIT)
       {
         thd->reset_for_next_command();
         thd->reset_killed();
         if (is_autocommit                           &&
             thd->lex->sql_command != SQLCOM_SELECT  &&
-            (thd->wsrep_retry_counter < thd->variables.wsrep_retry_autocommit))
+           (thd->wsrep_retry_counter < thd->variables.wsrep_retry_autocommit))
         {
-          WSREP_DEBUG("wsrep retrying AC query: %s", 
-                      (thd->query()) ? thd->query() : "void");
+          WSREP_DEBUG("wsrep retrying AC query: %lu  %s",
+                      thd->wsrep_retry_counter, WSREP_QUERY(thd));
 
-	  /* Performance Schema Interface instrumentation, end */
-	  MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
-	  thd->m_statement_psi= NULL;
-          thd->m_digest= NULL;
           close_thread_tables(thd);
 
-          thd->wsrep_conflict_state= RETRY_AUTOCOMMIT;
+          /*
+           * refactored, this assert does not hold anymore, wsrep_post_rollback()
+           * has cleared wsrep_exec_mode
+           */
+          assert(LOCAL_ROLLBACK != thd->wsrep_exec_mode);
+          assert(LOCAL_STATE    == thd->wsrep_exec_mode);
+//          thd->wsrep_exec_mode= LOCAL_STATE;
+//          WSREP_DEBUG("wsrep_mysql_parse(%lu) cleared LOCAL_ROLLBACK for seqno %lld",
+//                      thd->thread_id, (long long)wsrep_thd_trx_seqno(thd));
+          // thd->set_wsrep_conflict_state(RETRY_AUTOCOMMIT);
           thd->wsrep_retry_counter++;            // grow
           wsrep_copy_query(thd);
           thd->set_time();
           parser_state->reset(rawbuf, length);
+
+          /* PSI end */
+          MYSQL_END_STATEMENT(thd->m_statement_psi, thd->get_stmt_da());
+          thd->m_statement_psi= NULL;
+          thd->m_digest= NULL;
+
+          /* DTRACE end */
+          if (MYSQL_QUERY_DONE_ENABLED())
+          {
+            MYSQL_QUERY_DONE(thd->is_error());
+          }
+
+          /* SHOW PROFILE end */
+#if defined(ENABLED_PROFILING)
+          thd->profiling.finish_current_query();
+#endif
+
+          /* SHOW PROFILE begin */
+#if defined(ENABLED_PROFILING)
+          thd->profiling.start_new_query("continuing");
+          thd->profiling.set_query_source(rawbuf, length);
+#endif
+
+          /* DTRACE begin */
+          MYSQL_QUERY_START(rawbuf, thd->thread_id,
+                            (char *) (thd->db ? thd->db : ""),
+                            &thd->security_ctx->priv_user[0],
+                            (char *) thd->security_ctx->host_or_ip);
+
+          /* PSI begin */
+          thd->m_statement_psi= MYSQL_START_STATEMENT(&thd->m_statement_state,
+                                                      com_statement_info[thd->get_command()].m_key,
+                                                      thd->db, thd->db_length,
+                                                      thd->charset());
+          DBUG_ASSERT(thd->wsrep_next_trx_id() == WSREP_UNDEFINED_TRX_ID);
+          thd->set_wsrep_next_trx_id(thd->query_id);
+          WSREP_DEBUG("assigned new next trx id: %lu", thd->wsrep_next_trx_id());
         }
         else
         {
-          WSREP_DEBUG("%s, thd: %lld is_AC: %d, retry: %lu - %lu SQL: %s", 
-                      (thd->wsrep_conflict_state == ABORTED) ? 
+          WSREP_DEBUG("%s, thd: %lld is_AC: %d, retry: %lu - %lu SQL: %s",
+                      (thd->wsrep_conflict_state_unsafe() == ABORTED) ?
                       "BF Aborted" : "cert failure",
                       (longlong) thd->thread_id, is_autocommit,
                       thd->wsrep_retry_counter, 
-                      thd->variables.wsrep_retry_autocommit, thd->query());
+                      thd->variables.wsrep_retry_autocommit, WSREP_QUERY(thd));
           my_message(ER_LOCK_DEADLOCK, "wsrep aborted transaction", MYF(0));
           thd->reset_killed();
-          thd->wsrep_conflict_state= NO_CONFLICT;
-          if (thd->wsrep_conflict_state != REPLAYING)
+          thd->set_wsrep_conflict_state(NO_CONFLICT);
+          if (thd->wsrep_conflict_state() != REPLAYING)
             thd->wsrep_retry_counter= 0;             //  reset
         }
       }
@@ -7804,30 +8061,26 @@ static void wsrep_mysql_parse(THD *thd, char *rawbuf, uint length,
       {
         set_if_smaller(thd->wsrep_retry_counter, 0); // reset; eventually ok
       }
-      mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
     }
-
-    /* If retry is requested clean up explain structure */
-    if (thd->wsrep_conflict_state == RETRY_AUTOCOMMIT && thd->lex->explain)
-        delete_explain_query(thd->lex);
-
-  }  while (thd->wsrep_conflict_state== RETRY_AUTOCOMMIT);
+  }  while (thd->wsrep_conflict_state()== RETRY_AUTOCOMMIT);
+  mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
 
   if (thd->wsrep_retry_query)
   {
     WSREP_DEBUG("releasing retry_query: conf %d sent %d kill %d  errno %d SQL %s",
-                thd->wsrep_conflict_state,
-	    thd->get_stmt_da()->is_sent(),
+                thd->wsrep_conflict_state_unsafe(),
+                thd->get_stmt_da()->is_sent(),
                 thd->killed,
-	    thd->get_stmt_da()->is_error() ? thd->get_stmt_da()->sql_errno() : 0,
+                thd->get_stmt_da()->is_error() ? thd->get_stmt_da()->sql_errno() : 0,
                 thd->wsrep_retry_query);
     my_free(thd->wsrep_retry_query);
     thd->wsrep_retry_query      = NULL;
     thd->wsrep_retry_query_len  = 0;
     thd->wsrep_retry_command    = COM_CONNECT;
   }
-#endif /* WITH_WSREP */
+  return false;
 }
+#endif /* WITH_WSREP */
 
 /*
   When you modify mysql_parse(), you may need to modify
@@ -8821,7 +9074,7 @@ kill_one_thread(THD *thd, longlong id, killed_state kill_signal, killed_type typ
 
     if (((thd->security_ctx->master_access & SUPER_ACL) ||
         thd->security_ctx->user_matches(tmp->security_ctx)) &&
-	!wsrep_thd_is_BF(tmp, true))
+	!wsrep_thd_is_BF((void*)tmp, true))
     {
       tmp->awake(kill_signal);
       error=0;

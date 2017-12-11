@@ -272,6 +272,7 @@ row_upd_check_references_constraints(
 
 		if (foreign->referenced_index == index
 		    && (node->is_delete
+			|| node->vers_delete
 			|| row_upd_changes_first_fields_binary(
 				entry, index, node->update,
 				foreign->n_fields))) {
@@ -412,6 +413,7 @@ wsrep_row_upd_check_foreign_constraints(
 
 		if (foreign->foreign_index == index
 		    && (node->is_delete
+			|| node->vers_delete
 			|| row_upd_changes_first_fields_binary(
 				entry, index, node->update,
 				foreign->n_fields))) {
@@ -491,6 +493,8 @@ upd_node_create(
 	node->common.type = QUE_NODE_UPDATE;
 	node->state = UPD_NODE_UPDATE_CLUSTERED;
 	node->heap = mem_heap_create(128);
+	node->cmpl_info = 0;
+	node->versioned = false;
 	node->magic_n = UPD_NODE_MAGIC_N;
 
 	return(node);
@@ -2759,8 +2763,9 @@ check_fk:
 			if (err != DB_SUCCESS) {
 				goto err_exit;
 			}
+		}
 #ifdef WITH_WSREP
-		} else if (foreign && wsrep_must_process_fk(node, trx)) {
+		else if (foreign && wsrep_must_process_fk(node, trx)) {
 			err = wsrep_row_upd_check_foreign_constraints(
 				node, pcur, table, index, offsets, thr, mtr);
 
@@ -2782,8 +2787,8 @@ check_fk:
 					    << " table " << index->table->name;
 				goto err_exit;
 			}
-#endif /* WITH_WSREP */
 		}
+#endif /* WITH_WSREP */
 	}
 
 	mtr_commit(mtr);
@@ -2956,6 +2961,9 @@ row_upd_del_mark_clust_rec(
 	dberr_t		err;
 	rec_t*		rec;
 	trx_t*		trx = thr_get_trx(thr);
+#ifdef WITH_WSREP
+	que_node_t *parent = que_node_get_parent(node);
+#endif /* WITH_WSREP */
 
 	ut_ad(node);
 	ut_ad(dict_index_is_clust(index));
@@ -2986,8 +2994,12 @@ row_upd_del_mark_clust_rec(
 
 		err = row_upd_check_references_constraints(
 			node, pcur, index->table, index, offsets, thr, mtr);
+	}
 #ifdef WITH_WSREP
-	} else if (foreign && wsrep_must_process_fk(node, trx)) {
+	else if (trx && wsrep_on(trx->mysql_thd)  &&  err == DB_SUCCESS  &&
+	    (!parent || (que_node_get_type(parent) != QUE_NODE_UPDATE) ||
+	    ((upd_node_t*)parent)->cascade_upd_nodes->empty())
+	) {
 		err = wsrep_row_upd_check_foreign_constraints(
 			node, pcur, index->table, index, offsets, thr, mtr);
 

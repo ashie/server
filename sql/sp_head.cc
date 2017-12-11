@@ -49,10 +49,12 @@
 #define SP_INSTR_UINT_MAXLEN  8
 #define SP_STMT_PRINT_MAXLEN 40
 
-
 #include <my_user.h>
 
 extern "C" uchar *sp_table_key(const uchar *ptr, size_t *plen, my_bool first);
+#ifdef WITH_WSREP
+#include "rpl_handler.h"       // RUN_HOOK
+#endif /* WITH_WSREP */
 
 /**
   Helper function which operates on a THD object to set the query start_time to
@@ -1197,6 +1199,13 @@ sp_head::execute(THD *thd, bool merge_da_on_success)
     sql_digest_state *parent_digest= thd->m_digest;
     thd->m_digest= NULL;
 
+#ifdef WITH_WSREP
+    if (WSREP(thd) && thd->wsrep_next_trx_id() == WSREP_UNDEFINED_TRX_ID)
+    {
+      thd->set_wsrep_next_trx_id(thd->query_id);
+      WSREP_DEBUG("assigned new next trx ID for SP,  trx id: %lu", thd->wsrep_next_trx_id());
+    }
+#endif /* WITH_WSREP */
     err_status= i->execute(thd, &ip);
 
     thd->m_digest= parent_digest;
@@ -2529,6 +2538,7 @@ sp_head::restore_thd_mem_root(THD *thd)
   Item *flist= free_list;	// The old list
   set_query_arena(thd);         // Get new free_list and mem_root
   state= STMT_INITIALIZED_FOR_SP;
+  is_stored_procedure= true;
 
   DBUG_PRINT("info", ("mem_root %p returned from thd mem root %p",
                       &mem_root, &thd->mem_root));

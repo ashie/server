@@ -117,7 +117,7 @@ SELECT t2.name, t1.name FROM information_schema.innodb_sys_columns t1, informati
 name	name
 test/child	a1
 test/child	a2
-SELECT NAME FROM information_schema.INNODB_SYS_TABLES;
+SELECT NAME FROM information_schema.INNODB_SYS_TABLES WHERE NAME NOT LIKE 'wsrep%';
 NAME
 SYS_DATAFILES
 SYS_FOREIGN
@@ -126,6 +126,8 @@ SYS_TABLESPACES
 SYS_VIRTUAL
 mysql/innodb_index_stats
 mysql/innodb_table_stats
+mysql/transaction_registry
+mysql/vtmd_template
 test/child
 test/parent
 INSERT INTO child VALUES(5,4);
@@ -308,7 +310,7 @@ SELECT t2.name, t1.name FROM information_schema.innodb_sys_columns t1, informati
 name	name
 test/child	a1
 test/child	a2
-SELECT NAME FROM information_schema.INNODB_SYS_TABLES;
+SELECT NAME FROM information_schema.INNODB_SYS_TABLES WHERE NAME NOT LIKE 'wsrep%';
 NAME
 SYS_DATAFILES
 SYS_FOREIGN
@@ -317,6 +319,8 @@ SYS_TABLESPACES
 SYS_VIRTUAL
 mysql/innodb_index_stats
 mysql/innodb_table_stats
+mysql/transaction_registry
+mysql/vtmd_template
 test/child
 test/parent
 ALTER TABLE child ADD PRIMARY KEY idx (a3), CHANGE a1 a3 INT,
@@ -333,7 +337,7 @@ SELECT t2.name, t1.name FROM information_schema.innodb_sys_columns t1, informati
 name	name
 test/child	a2
 test/child	a3
-SELECT NAME FROM information_schema.INNODB_SYS_TABLES;
+SELECT NAME FROM information_schema.INNODB_SYS_TABLES WHERE NAME NOT LIKE 'wsrep%';
 NAME
 SYS_DATAFILES
 SYS_FOREIGN
@@ -342,6 +346,8 @@ SYS_TABLESPACES
 SYS_VIRTUAL
 mysql/innodb_index_stats
 mysql/innodb_table_stats
+mysql/transaction_registry
+mysql/vtmd_template
 test/child
 test/parent
 SHOW CREATE TABLE child;
@@ -369,7 +375,7 @@ SELECT t2.name, t1.name FROM information_schema.innodb_sys_columns t1, informati
 name	name
 test/child	a1
 test/child	a2
-SELECT NAME FROM information_schema.INNODB_SYS_TABLES;
+SELECT NAME FROM information_schema.INNODB_SYS_TABLES WHERE NAME NOT LIKE 'wsrep%';
 NAME
 SYS_DATAFILES
 SYS_FOREIGN
@@ -378,6 +384,8 @@ SYS_TABLESPACES
 SYS_VIRTUAL
 mysql/innodb_index_stats
 mysql/innodb_table_stats
+mysql/transaction_registry
+mysql/vtmd_template
 test/child
 test/parent
 SHOW CREATE TABLE child;
@@ -405,7 +413,7 @@ SELECT t2.name, t1.name FROM information_schema.innodb_sys_columns t1, informati
 name	name
 test/child	a2
 test/child	a3
-SELECT NAME FROM information_schema.INNODB_SYS_TABLES;
+SELECT NAME FROM information_schema.INNODB_SYS_TABLES WHERE NAME NOT LIKE 'wsrep%';
 NAME
 SYS_DATAFILES
 SYS_FOREIGN
@@ -414,6 +422,8 @@ SYS_TABLESPACES
 SYS_VIRTUAL
 mysql/innodb_index_stats
 mysql/innodb_table_stats
+mysql/transaction_registry
+mysql/vtmd_template
 test/child
 test/parent
 SHOW CREATE TABLE child;

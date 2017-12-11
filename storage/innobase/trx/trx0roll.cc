@@ -136,6 +136,7 @@ trx_rollback_to_savepoint_low(
 		}
 		trx->lock.que_state = TRX_QUE_RUNNING;
 		MONITOR_INC(MONITOR_TRX_ROLLBACK_SAVEPOINT);
+		trx->vers_update_trt = savept->vers_update_trt;
 	}
 
 	ut_a(trx->error_state == DB_SUCCESS);
@@ -160,6 +161,11 @@ trx_rollback_to_savepoint(
 				partial rollback requested, or NULL for
 				complete rollback */
 {
+#ifdef WITH_WSREP
+	if (wsrep_on(trx->mysql_thd) && savept == NULL) {
+		wsrep_handle_SR_rollback(NULL, trx->mysql_thd);
+	}
+#endif /* WITH_WSREP */
 	ut_ad(!trx_mutex_own(trx));
 
 	trx_start_if_not_started_xa(trx, true);
@@ -625,6 +631,7 @@ trx_savept_take(
 	trx_savept_t	savept;
 
 	savept.least_undo_no = trx->undo_no;
+	savept.vers_update_trt = trx->vers_update_trt;
 
 	return(savept);
 }

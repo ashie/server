@@ -1512,6 +1512,8 @@ struct dict_table_t {
 	/** Add the table definition to the data dictionary cache */
 	void add_to_cache();
 
+	bool versioned() const { return vers_start || vers_end; }
+
 	/** Id of the table. */
 	table_id_t				id;
 
@@ -1625,7 +1627,10 @@ struct dict_table_t {
 
 	/** Virtual column names */
 	const char*				v_col_names;
-
+	unsigned	vers_start:10;
+				/*!< System Versioning: row start col index */
+	unsigned	vers_end:10;
+				/*!< System Versioning: row end col index */
 	bool		is_system_db;
 				/*!< True if the table belongs to a system
 				database (mysql, information_schema or

@@ -100,6 +100,8 @@
 
 #include "rpl_handler.h"
 
+#include "transaction.h"
+
 #ifdef HAVE_SYS_PRCTL_H
 #include <sys/prctl.h>
 #endif
@@ -533,6 +535,7 @@ ulonglong slave_skipped_errors;
 ulong feature_files_opened_with_delayed_keys= 0, feature_check_constraint= 0;
 ulonglong denied_connections;
 my_decimal decimal_zero;
+my_bool opt_transaction_registry= 1;
 
 /*
   Maximum length of parameter value which can be set through
@@ -945,6 +948,9 @@ PSI_mutex_key key_LOCK_prepare_ordered, key_LOCK_commit_ordered,
   key_LOCK_slave_background;
 PSI_mutex_key key_TABLE_SHARE_LOCK_share;
 
+PSI_mutex_key key_TABLE_SHARE_LOCK_rotation;
+PSI_cond_key key_TABLE_SHARE_COND_rotation;
+
 static PSI_mutex_info all_server_mutexes[]=
 {
 #ifdef HAVE_MMAP
@@ -1006,6 +1012,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_structure_guard_mutex, "Query_cache::structure_guard_mutex", 0},
   { &key_TABLE_SHARE_LOCK_ha_data, "TABLE_SHARE::LOCK_ha_data", 0},
   { &key_TABLE_SHARE_LOCK_share, "TABLE_SHARE::LOCK_share", 0},
+  { &key_TABLE_SHARE_LOCK_rotation, "TABLE_SHARE::LOCK_rotation", 0},
   { &key_LOCK_error_messages, "LOCK_error_messages", PSI_FLAG_GLOBAL},
   { &key_LOCK_prepare_ordered, "LOCK_prepare_ordered", PSI_FLAG_GLOBAL},
   { &key_LOCK_after_binlog_sync, "LOCK_after_binlog_sync", PSI_FLAG_GLOBAL},
@@ -1026,8 +1033,8 @@ static PSI_mutex_info all_server_mutexes[]=
 PSI_rwlock_key key_rwlock_LOCK_grant, key_rwlock_LOCK_logger,
   key_rwlock_LOCK_sys_init_connect, key_rwlock_LOCK_sys_init_slave,
   key_rwlock_LOCK_system_variables_hash, key_rwlock_query_cache_query_lock,
-  key_LOCK_SEQUENCE;
-
+  key_LOCK_SEQUENCE,
+  key_rwlock_LOCK_vers_stats, key_rwlock_LOCK_stat_serial;
 
 static PSI_rwlock_info all_server_rwlocks[]=
 {
@@ -1040,7 +1047,9 @@ static PSI_rwlock_info all_server_rwlocks[]=
   { &key_rwlock_LOCK_sys_init_slave, "LOCK_sys_init_slave", PSI_FLAG_GLOBAL},
   { &key_LOCK_SEQUENCE, "LOCK_SEQUENCE", 0},
   { &key_rwlock_LOCK_system_variables_hash, "LOCK_system_variables_hash", PSI_FLAG_GLOBAL},
-  { &key_rwlock_query_cache_query_lock, "Query_cache_query::lock", 0}
+  { &key_rwlock_query_cache_query_lock, "Query_cache_query::lock", 0},
+  { &key_rwlock_LOCK_vers_stats, "Vers_field_stats::lock", 0},
+  { &key_rwlock_LOCK_stat_serial, "TABLE_SHARE::LOCK_stat_serial", 0}
 };
 
 #ifdef HAVE_MMAP
@@ -1123,7 +1132,8 @@ static PSI_cond_info all_server_conds[]=
   { &key_COND_slave_background, "COND_slave_background", 0},
   { &key_COND_start_thread, "COND_start_thread", PSI_FLAG_GLOBAL},
   { &key_COND_wait_gtid, "COND_wait_gtid", 0},
-  { &key_COND_gtid_ignore_duplicates, "COND_gtid_ignore_duplicates", 0}
+  { &key_COND_gtid_ignore_duplicates, "COND_gtid_ignore_duplicates", 0},
+  { &key_TABLE_SHARE_COND_rotation, "TABLE_SHARE::COND_rotation", 0}
 };
 
 PSI_thread_key key_thread_bootstrap, key_thread_delayed_insert,
@@ -1816,6 +1826,10 @@ static void close_connections(void)
     mysql_mutex_unlock(&LOCK_thread_count);
   }
   end_slave();
+#ifdef WITH_WSREP
+  if (wsrep_inited == 1)
+    wsrep_deinit(true);
+#endif
   /* All threads has now been aborted */
   DBUG_PRINT("quit",("Waiting for threads to die (count=%u)",thread_count));
   mysql_mutex_lock(&LOCK_thread_count);
@@ -2001,7 +2015,7 @@ static void __cdecl kill_server(int sig_ptr)
   /* Stop wsrep threads in case they are running. */
   if (wsrep_running_threads > 0)
   {
-    wsrep_stop_replication(NULL);
+    wsrep_shutdown_replication();
   }
 
   close_connections();
@@ -2113,10 +2127,14 @@ extern "C" void unireg_abort(int exit_code)
   if (wsrep)
   {
     /*
+      Signal SE init waiters to exit with error status
+     */
+    wsrep_SE_init_failed();
+    /*
       This is an abort situation, we cannot expect to gracefully close all
       wsrep threads here, we can only diconnect from service
     */
-    wsrep_close_client_connections(FALSE);
+    wsrep_close_client_connections(FALSE, NULL);
     shutdown_in_progress= 1;
     wsrep->disconnect(wsrep);
     WSREP_INFO("Service disconnected.");
@@ -2167,7 +2185,9 @@ static void mysqld_exit(int exit_code)
             (long) global_status_var.global_memory_used);
   if (!opt_debugging && !my_disable_leak_check && exit_code == 0)
   {
-    DBUG_SLOW_ASSERT(global_status_var.global_memory_used == 0);
+    fprintf(stderr, "Seppo Warning: Memory not freed: %ld\n",
+            (long) global_status_var.global_memory_used);
+    //DBUG_SLOW_ASSERT(global_status_var.global_memory_used == 0);
   }
   cleanup_tls();
   DBUG_LEAVE;
@@ -6018,6 +6038,26 @@ int mysqld_main(int argc, char **argv)
   if (Events::init((THD*) 0, opt_noacl || opt_bootstrap))
     unireg_abort(1);
 
+  if (!opt_bootstrap && opt_transaction_registry)
+  {
+    THD *thd = new THD(0);
+    thd->thread_stack= (char*) &thd;
+    thd->store_globals();
+
+    {
+      TR_table trt(thd);
+      if (trt.check())
+      {
+        sql_print_error("%s schema is incorrect", trt.table_name);
+        delete thd;
+        unireg_abort(1);
+      }
+    }
+
+    trans_commit_stmt(thd);
+    delete thd;
+  }
+
   if (WSREP_ON)
   {
     if (opt_bootstrap)
@@ -6034,10 +6074,7 @@ int mysqld_main(int argc, char **argv)
         wsrep_SE_init_grab();
         wsrep_SE_init_done();
         /*! in case of SST wsrep waits for wsrep->sst_received */
-        if (wsrep_sst_continue())
-        {
-          WSREP_ERROR("Failed to signal the wsrep provider to continue.");
-        }
+        wsrep_sst_continue();
       }
       else
       {
@@ -8650,6 +8687,19 @@ SHOW_VAR status_vars[]= {
   {"Uptime_since_flush_status",(char*) &show_flushstatustime,   SHOW_SIMPLE_FUNC},
 #endif
 #ifdef WITH_WSREP
+  {"wsrep_connected",         (char*) &wsrep_connected,         SHOW_BOOL},
+  {"wsrep_ready",             (char*) &wsrep_show_ready,        SHOW_FUNC},
+  {"wsrep_cluster_state_uuid",(char*) &wsrep_cluster_state_uuid,SHOW_CHAR_PTR},
+  {"wsrep_cluster_conf_id",   (char*) &wsrep_cluster_conf_id,   SHOW_LONGLONG},
+  {"wsrep_cluster_status",    (char*) &wsrep_cluster_status,    SHOW_CHAR_PTR},
+  {"wsrep_cluster_size",      (char*) &wsrep_cluster_size,      SHOW_LONG_NOFLUSH},
+  {"wsrep_local_index",       (char*) &wsrep_local_index,       SHOW_LONG_NOFLUSH},
+  {"wsrep_local_bf_aborts",   (char*) &wsrep_show_bf_aborts,    SHOW_FUNC},
+  {"wsrep_provider_name",     (char*) &wsrep_provider_name,     SHOW_CHAR_PTR},
+  {"wsrep_provider_version",  (char*) &wsrep_provider_version,  SHOW_CHAR_PTR},
+  {"wsrep_provider_vendor",   (char*) &wsrep_provider_vendor,   SHOW_CHAR_PTR},
+  {"wsrep_provider_capabilities", (char*) &wsrep_provider_capabilities, SHOW_CHAR_PTR},
+  {"wsrep_thread_count",      (char*) &wsrep_running_threads,   SHOW_LONG_NOFLUSH},
   {"wsrep",                    (char*) &wsrep_show_status,       SHOW_FUNC},
 #endif
   {NullS, NullS, SHOW_LONG}
@@ -9805,7 +9855,10 @@ static int get_options(int *argc_ptr, char ***argv_ptr)
   /* Ensure that some variables are not set higher than needed */
   if (thread_cache_size > max_connections)
     SYSVAR_AUTOSIZE(thread_cache_size, max_connections);
-  
+
+  if (opt_bootstrap)
+    global_system_variables.vers_force= 0;
+
   return 0;
 }
 

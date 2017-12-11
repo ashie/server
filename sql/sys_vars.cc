@@ -387,6 +387,47 @@ static Sys_var_charptr Sys_my_bind_addr(
        READ_ONLY GLOBAL_VAR(my_bind_addr_str), CMD_LINE(REQUIRED_ARG),
        IN_FS_CHARSET, DEFAULT(0));
 
+const char *Sys_var_vers_asof::asof_keywords[]= {"CURRENT", "ALL", NULL};
+static Sys_var_vers_asof Sys_vers_asof_timestamp(
+       "versioning_asof_timestamp", "Default AS OF value for versioned queries",
+       SESSION_VAR(vers_asof_timestamp.type), NO_CMD_LINE,
+       Sys_var_vers_asof::asof_keywords, DEFAULT(FOR_SYSTEM_TIME_UNSPECIFIED));
+
+static Sys_var_mybool Sys_vers_force(
+       "versioning_force", "Force system versioning for all created tables",
+       SESSION_VAR(vers_force), CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static const char *vers_hide_keywords[]= {"AUTO", "IMPLICIT", "FULL", "NEVER", NULL};
+static Sys_var_enum Sys_vers_hide(
+       "versioning_hide", "Hide system versioning from being displayed in table info. "
+       "AUTO: hide implicit system fields only in non-versioned and AS OF queries; "
+       "IMPLICIT: hide implicit system fields in all queries; "
+       "FULL: hide any system fields in all queries and hide versioning info in SHOW commands; "
+       "NEVER: don't hide system fields",
+       SESSION_VAR(vers_hide), CMD_LINE(REQUIRED_ARG),
+       vers_hide_keywords, DEFAULT(VERS_HIDE_AUTO));
+
+static Sys_var_mybool Sys_vers_innodb_algorithm_simple(
+       "versioning_innodb_algorithm_simple",
+       "Use simple algorithm of timestamp handling in InnoDB instead of TRX_SEES",
+       SESSION_VAR(vers_innodb_algorithm_simple), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE));
+
+static const char *vers_alter_history_keywords[]= {"KEEP", "SURVIVE", "DROP", NULL};
+static Sys_var_enum Sys_vers_alter_history(
+       "versioning_alter_history", "Versioning ALTER TABLE mode. "
+       "KEEP: leave historical system rows as is on ALTER TABLE; "
+       "SURVIVE: use DDL survival feature; "
+       "DROP: delete historical system rows on ALTER TABLE",
+       SESSION_VAR(vers_alter_history), CMD_LINE(REQUIRED_ARG),
+       vers_alter_history_keywords, DEFAULT(VERS_ALTER_HISTORY_KEEP));
+
+static Sys_var_mybool Sys_transaction_registry(
+       "transaction_registry",
+       "Enable or disable update of transaction_registry",
+       GLOBAL_VAR(opt_transaction_registry), CMD_LINE(OPT_ARG),
+       DEFAULT(TRUE));
+
 static Sys_var_ulonglong Sys_binlog_cache_size(
        "binlog_cache_size", "The size of the transactional cache for "
        "updates to transactional engines for the binary log. "
@@ -5164,7 +5205,7 @@ static Sys_var_ulong Sys_wsrep_max_ws_size (
        GLOBAL_VAR(wsrep_max_ws_size), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(1024, WSREP_MAX_WS_SIZE), DEFAULT(WSREP_MAX_WS_SIZE),
        BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
-       ON_CHECK(wsrep_max_ws_size_check), ON_UPDATE(wsrep_max_ws_size_update));
+       ON_CHECK(0), ON_UPDATE(wsrep_max_ws_size_update));
 
 static Sys_var_ulong Sys_wsrep_max_ws_rows (
        "wsrep_max_ws_rows", "Max number of rows in write set",
@@ -5201,7 +5242,7 @@ static Sys_var_uint Sys_wsrep_sync_wait(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
        ON_UPDATE(wsrep_sync_wait_update));
 
-static const char *wsrep_OSU_method_names[]= { "TOI", "RSU", NullS };
+static const char *wsrep_OSU_method_names[]= { "TOI", "RSU", "NBO", NullS };
 static Sys_var_enum Sys_wsrep_OSU_method(
        "wsrep_OSU_method", "Method for Online Schema Upgrade",
        SESSION_VAR(wsrep_OSU_method), CMD_LINE(OPT_ARG),
@@ -5217,6 +5258,14 @@ static Sys_var_mybool Sys_wsrep_desync (
        &PLock_wsrep_desync, NOT_IN_BINLOG,
        ON_CHECK(wsrep_desync_check),
        ON_UPDATE(wsrep_desync_update));
+
+static const char *wsrep_reject_queries_names[]= { "NONE", "ALL", "ALL_KILL", NullS };
+static Sys_var_enum Sys_wsrep_reject_queries(
+       "wsrep_reject_queries", "Variable to set to reject queries",
+       GLOBAL_VAR(wsrep_reject_queries), CMD_LINE(OPT_ARG),
+       wsrep_reject_queries_names, DEFAULT(WSREP_REJECT_NONE),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+       ON_UPDATE(wsrep_reject_queries_update));
 
 static const char *wsrep_binlog_format_names[]=
        {"MIXED", "STATEMENT", "ROW", "NONE", NullS};
@@ -5245,7 +5294,7 @@ static Sys_var_ulong Sys_wsrep_mysql_replication_bundle(
 
 static Sys_var_mybool Sys_wsrep_load_data_splitting(
        "wsrep_load_data_splitting", "To commit LOAD DATA "
-       "transaction after every 10K rows inserted",
+       "transaction after every 10K rows inserted (deprecating)",
        GLOBAL_VAR(wsrep_load_data_splitting), 
        CMD_LINE(OPT_ARG), DEFAULT(TRUE));
 
@@ -5265,11 +5314,43 @@ static Sys_var_mybool Sys_wsrep_restart_slave(
        "wsrep_restart_slave", "Should MariaDB slave be restarted automatically, when node joins back to cluster",
        GLOBAL_VAR(wsrep_restart_slave), CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
+static Sys_var_ulong Sys_wsrep_trx_fragment_size(
+      "wsrep_trx_fragment_size",
+      "Size of transaction fragments for streaming replication (measured in "
+      "units of 'wsrep_trx_fragment_unit')",
+       SESSION_VAR(wsrep_trx_fragment_size), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(0, WSREP_MAX_WS_SIZE), DEFAULT(0), BLOCK_SIZE(1),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(wsrep_trx_fragment_size_check));
+
+extern const char *wsrep_fragment_units[];
+
+static Sys_var_enum Sys_wsrep_trx_fragment_unit(
+      "wsrep_trx_fragment_unit",
+      "Unit for streaming replication transaction fragments' size: bytes, "
+      "events, rows, statements",
+      SESSION_VAR(wsrep_trx_fragment_unit), CMD_LINE(REQUIRED_ARG),
+      wsrep_fragment_units,
+      DEFAULT(WSREP_FRAG_BYTES),
+      NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0));
+
+extern const char *wsrep_SR_store_types[];
+static Sys_var_enum Sys_wsrep_SR_store(
+       "wsrep_SR_store", "Storage for streaming replication fragments",
+       READ_ONLY GLOBAL_VAR(wsrep_SR_store_type), CMD_LINE(REQUIRED_ARG),
+       wsrep_SR_store_types, DEFAULT(WSREP_SR_STORE_TABLE),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_mybool Sys_wsrep_dirty_reads(
        "wsrep_dirty_reads",
        "Allow reads even when the node is not in the primary component.",
        SESSION_VAR(wsrep_dirty_reads), CMD_LINE(OPT_ARG),
        DEFAULT(FALSE), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_wsrep_ignore_apply_errors (
+       "wsrep_ignore_apply_errors", "Ignore replication errors",
+       GLOBAL_VAR(wsrep_ignore_apply_errors), CMD_LINE(REQUIRED_ARG),
+       VALID_RANGE(WSREP_IGNORE_ERRORS_NONE, WSREP_IGNORE_ERRORS_MAX),
+       DEFAULT(7), BLOCK_SIZE(1));
 
 static Sys_var_uint Sys_wsrep_gtid_domain_id(
        "wsrep_gtid_domain_id", "When wsrep_gtid_mode is set, this value is "

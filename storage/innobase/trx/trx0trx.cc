@@ -145,6 +145,8 @@ trx_init(
 
 	trx->check_unique_secondary = true;
 
+	trx->vers_update_trt = false;
+
 	trx->lock.n_rec_locks = 0;
 
 	trx->dict_operation = TRX_DICT_OP_NONE;
@@ -1450,8 +1452,16 @@ trx_write_serialisation_history(
 	trx_sysf_t* sys_header = trx_sysf_get(mtr);
 #ifdef WITH_WSREP
 	/* Update latest MySQL wsrep XID in trx sys header. */
-	if (wsrep_is_wsrep_xid(trx->xid)) {
-		trx_sys_update_wsrep_checkpoint(trx->xid, sys_header, mtr);
+	if (wsrep_on(trx->mysql_thd) &&
+	    !wsrep_thd_is_SR(trx->mysql_thd))
+	{
+          //xid_t xid = {-1, 0, 0, {}};
+          xid_t xid = xid_t();
+		wsrep_thd_xid(trx->mysql_thd, &xid, sizeof(xid));
+		if (wsrep_is_wsrep_xid(&xid))
+		{
+			trx_sys_update_wsrep_checkpoint(&xid, sys_header, mtr);
+		}
 	}
 #endif /* WITH_WSREP */
 
@@ -2425,6 +2435,7 @@ without locking lock_sys->mutex. */
 UNIV_INTERN
 void
 wsrep_trx_print_locking(
+/*==========*/
 	FILE*		f,
 			/*!< in: output stream */
 	const trx_t*	trx,

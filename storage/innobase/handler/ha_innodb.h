@@ -586,6 +586,8 @@ bool thd_is_strict_mode(const MYSQL_THD thd);
  */
 extern void mysql_bin_log_commit_pos(THD *thd, ulonglong *out_pos, const char **out_file);
 
+extern void thd_vers_update_trt(THD * thd, bool value);
+
 /** Get the partition_info working copy.
 @param	thd	Thread object.
 @return	NULL or pointer to partition_info working copy. */
@@ -598,7 +600,6 @@ thd_get_work_part_info(
 struct trx_t;
 #ifdef WITH_WSREP
 #include <mysql/service_wsrep.h>
-//extern "C" int wsrep_trx_order_before(void *thd1, void *thd2);
 
 extern "C" bool wsrep_thd_is_wsrep_on(THD *thd);
 
@@ -658,10 +659,6 @@ innobase_index_name_is_reserved(
 	ulint		num_of_keys)	/*!< in: Number of indexes to
 					be created. */
 	MY_ATTRIBUTE((nonnull(1), warn_unused_result));
-
-#ifdef WITH_WSREP
-//extern "C" int wsrep_trx_is_aborting(void *thd_ptr);
-#endif
 
 /** Parse hint for table and its indexes, and update the information
 in dictionary.
